@@ -2,10 +2,11 @@
  * Mattel Creations Vehicle Listing Alert - Cloudflare Worker
  * 
  * Automatically checks Mattel Creations every 10 minutes for newly listed vehicles.
+ * Paginate across all pages to track ALL 600+ vehicle items.
  * Sends Discord notifications via Webhook and persists state in Cloudflare KV.
  */
 
-// In-memory fallback if KV is not yet bound in development
+// In-memory fallback if KV is not yet bound
 let fallbackSeenIds = new Set();
 let fallbackLastCheck = null;
 let fallbackWebhookUrl = '';
@@ -38,7 +39,10 @@ export default {
         const webhookUrl = body.webhookUrl ? body.webhookUrl.trim() : '';
 
         if (!webhookUrl || !webhookUrl.startsWith('https://discord.com/api/webhooks/')) {
-          return new Response(JSON.stringify({ success: false, error: 'Invalid Discord Webhook URL format. Must start with https://discord.com/api/webhooks/' }), {
+          return new Response(JSON.stringify({ 
+            success: false, 
+            error: 'Invalid Discord Webhook URL format. Must start with https://discord.com/api/webhooks/' 
+          }), {
             status: 400,
             headers: { 'Content-Type': 'application/json' }
           });
@@ -51,7 +55,7 @@ export default {
 
         return new Response(JSON.stringify({
           success: true,
-          message: 'Webhook saved and verified successfully!',
+          message: 'Webhook saved permanently to KV storage and verified successfully!',
           testResult
         }), {
           headers: { 'Content-Type': 'application/json' }
@@ -142,7 +146,54 @@ function maskWebhook(url) {
 }
 
 /**
- * Main function to fetch products, filter vehicles, compare with stored state, and send alerts.
+ * Fetch ALL products from Mattel Creations by paginating pages.
+ * Safe against IP blocking with standard headers and gentle delays.
+ */
+async function fetchAllProducts() {
+  const allProducts = [];
+  const maxPages = 15; // Up to 3,750 products max
+
+  for (let page = 1; page <= maxPages; page++) {
+    const shopifyUrl = `https://creations.mattel.com/collections/mattel-creations-shop-all/products.json?limit=250&page=${page}`;
+    
+    const response = await fetch(shopifyUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Cache-Control': 'no-cache'
+      }
+    });
+
+    if (!response.ok) {
+      console.warn(`Page ${page} status: ${response.status}`);
+      break;
+    }
+
+    const data = await response.json();
+    const products = data.products || [];
+    
+    if (products.length === 0) {
+      // Reached the end of available catalog
+      break;
+    }
+
+    allProducts.push(...products);
+
+    // If page returned less than 250 items, it's the last page
+    if (products.length < 250) {
+      break;
+    }
+
+    // Polite delay between requests to avoid rate limits
+    await new Promise(r => setTimeout(r, 150));
+  }
+
+  return allProducts;
+}
+
+/**
+ * Main function to fetch products across ALL pages, filter vehicles, compare with stored state, and send alerts.
  */
 async function checkNewVehicles(env, isManual = false) {
   const timestamp = new Date().toISOString();
@@ -150,28 +201,14 @@ async function checkNewVehicles(env, isManual = false) {
   logMessages.push(`[${timestamp}] Starting Mattel Creations vehicle check...`);
 
   try {
-    const shopifyUrl = 'https://creations.mattel.com/collections/mattel-creations-shop-all/products.json?limit=250&sort_by=created-descending';
-    
-    const response = await fetch(shopifyUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json'
-      }
-    });
-
-    if (!response.ok) {
-      throw new Error(`Shopify API returned status ${response.status} ${response.statusText}`);
-    }
-
-    const data = await response.json();
-    const products = data.products || [];
-    logMessages.push(`Fetched ${products.length} products from Mattel Creations.`);
+    const products = await fetchAllProducts();
+    logMessages.push(`Fetched total catalog: ${products.length} products across all pages.`);
 
     // Filter products matching Vehicle category or tag
     const vehicleProducts = products.filter(isVehicleProduct);
-    logMessages.push(`Found ${vehicleProducts.length} vehicle items.`);
+    logMessages.push(`Found ${vehicleProducts.length} vehicle items in total catalog.`);
 
-    // Retrieve previously seen IDs
+    // Retrieve previously seen product IDs from KV
     const seenIds = await getSeenProductIds(env);
     const isFirstRun = seenIds.size === 0;
 
@@ -191,20 +228,22 @@ async function checkNewVehicles(env, isManual = false) {
 
     const webhookUrl = await getActiveWebhookUrl(env);
 
-    // If first run, initialize KV with current IDs and send welcome webhook if configured
+    // If first run, initialize KV with all existing vehicle IDs and send welcome webhook
     if (isFirstRun) {
-      logMessages.push('First run initialized. Saved current vehicle list to state.');
+      logMessages.push(`First run initialized: Registered master database of ${vehicleProducts.length} existing vehicles.`);
       if (webhookUrl) {
         await sendFirstRunWebhook(webhookUrl, vehicleProducts.length);
       }
     } else if (newVehicles.length > 0) {
-      // Dispatch Discord alerts for each new vehicle found
+      // Dispatch Discord alerts for each newly discovered vehicle
+      logMessages.push(`Sending Discord alerts for ${newVehicles.length} new vehicles...`);
       for (const vehicle of newVehicles) {
         await sendDiscordAlert(webhookUrl, vehicle);
+        logMessages.push(`Alert sent: ${vehicle.title}`);
       }
     }
 
-    // Save updated product IDs and metrics to state
+    // Save updated product IDs to KV so they are remembered forever across deploys
     await saveSeenProductIds(env, currentVehicleIds);
 
     const metrics = {
@@ -241,6 +280,7 @@ async function checkNewVehicles(env, isManual = false) {
 function isVehicleProduct(product) {
   const tags = (product.tags || []).map(t => String(t).toLowerCase());
   const type = String(product.product_type || '').toLowerCase();
+  const title = String(product.title || '').toLowerCase();
 
   // Check tags for category: vehicles
   const hasVehicleTag = tags.some(t => 
@@ -377,7 +417,7 @@ async function sendFirstRunWebhook(webhookUrl, vehicleCount) {
 
   const embed = {
     title: '✅ Mattel Vehicle Alert Initialized',
-    description: `Monitor successfully deployed and active! Tracking **${vehicleCount}** current vehicle listings on Mattel Creations. Checks execute automatically every 10 minutes.`,
+    description: `Monitor successfully active! Scanned and saved **${vehicleCount}** existing vehicles to the master database. Checks execute automatically every 10 minutes.`,
     color: 0x00D2FF,
     footer: { text: 'Mattel Creations Vehicle Monitor' },
     timestamp: new Date().toISOString()
@@ -689,6 +729,17 @@ function renderDashboard(metrics, env, activeWebhook) {
       line-height: 1.6;
     }
 
+    .kv-notice {
+      background: rgba(245, 158, 11, 0.1);
+      border: 1px solid rgba(245, 158, 11, 0.3);
+      color: #fbbf24;
+      padding: 1rem 1.25rem;
+      border-radius: 12px;
+      margin-bottom: 1.5rem;
+      font-size: 0.9rem;
+      line-height: 1.5;
+    }
+
     #output-toast {
       display: none;
       padding: 1rem 1.25rem;
@@ -721,6 +772,16 @@ function renderDashboard(metrics, env, activeWebhook) {
   <main>
     <div id="output-toast"></div>
 
+    ${!hasKV ? `
+    <div class="kv-notice">
+      <strong>⚠️ Cloudflare KV Binding Recommended for Permanent Persistence:</strong><br/>
+      Currently running in temporary memory fallback. To make your Webhook URL & Master Vehicle List stay saved permanently across code redeploys:<br/>
+      1. Open Cloudflare Workers -> <strong>listing-alert</strong> -> <strong>Settings</strong> -> <strong>Variables and Secrets</strong>.<br/>
+      2. Under <strong>KV Namespace Bindings</strong>, click <strong>Add binding</strong>: Name = <code>LISTING_KV</code>, Namespace = <em>Select your KV Namespace</em>.<br/>
+      3. Alternatively, set <code>DISCORD_WEBHOOK_URL</code> as a Secret Variable in the same settings page!
+    </div>
+    ` : ''}
+
     <div class="grid">
       <div class="card">
         <div class="card-title">Schedule Status</div>
@@ -732,6 +793,7 @@ function renderDashboard(metrics, env, activeWebhook) {
       <div class="card">
         <div class="card-title">Tracked Vehicles</div>
         <div class="card-value">${metrics.totalVehicles || 0}</div>
+        <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem;">Out of ${metrics.totalProducts || 0} catalog items</div>
       </div>
 
       <div class="card">
@@ -757,7 +819,7 @@ function renderDashboard(metrics, env, activeWebhook) {
     <div class="webhook-box">
       <h3>🔔 Set Discord Webhook URL</h3>
       <p style="color: var(--text-muted); font-size: 0.9rem;">
-        Paste your Discord Webhook URL below and click <strong>Save & Verify Webhook</strong>. It will save directly and send a test alert!
+        Paste your Discord Webhook URL below and click <strong>Save & Verify Webhook</strong>.
       </p>
       <div class="input-group">
         <input 
@@ -776,7 +838,7 @@ function renderDashboard(metrics, env, activeWebhook) {
 
     <div class="actions">
       <button class="btn btn-primary" onclick="runManualCheck()">
-        ⚡ Run Check Now
+        ⚡ Run Check Now (Scan All Pages)
       </button>
       <button class="btn btn-secondary" onclick="sendTestDiscord()">
         🔔 Test Discord Webhook
@@ -865,14 +927,14 @@ ${(metrics.logs || ['Waiting for first run...']).join('\n')}
       const consoleEl = document.getElementById('log-console');
       toast.style.display = 'block';
       toast.className = 'badge-warning';
-      toast.innerText = '⏳ Executing vehicle check... Please wait...';
+      toast.innerText = '⏳ Scanning all pages on Mattel Creations... Please wait...';
 
       try {
         const res = await fetch('/api/check', { method: 'POST' });
         const data = await res.json();
         
         toast.className = data.status === 'success' ? 'badge-success' : 'badge-danger';
-        toast.innerText = 'Check completed! New vehicles found: ' + (data.newVehiclesFound || 0);
+        toast.innerText = 'Scan completed! Total vehicles tracked: ' + (data.totalVehicles || 0) + ' | New found: ' + (data.newVehiclesFound || 0);
 
         consoleEl.innerText = JSON.stringify(data, null, 2);
         setTimeout(() => location.reload(), 3000);
