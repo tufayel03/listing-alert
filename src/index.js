@@ -5,9 +5,11 @@
  * 1. Mattel Creations (Vehicles Category) - https://creations.mattel.com/collections/mattel-creations-shop-all
  * 2. JCAR Diecast (Hot Wheels Collection) - https://www.jcardiecast.com/collections/hot-wheels
  * 
- * Efficient & Reliable: Single-call master KV array persistence prevents subrequest timeouts.
- * Timezone: Bangladesh Dhaka Time (Asia/Dhaka).
- * Alerts: Ultra-clean, concise (Name, Price, Link, Image, Dhaka Time).
+ * Optimized Architecture:
+ * - Routine 10-Minute Cron: Scans Page 1 & 2 with `sort_by=created-descending` (Ultra-fast <400ms scan).
+ * - First Run / Master Sync: Scans all pages to register entire historical catalog.
+ * - Timezone: Bangladesh Dhaka Time (Asia/Dhaka).
+ * - Alerts: Ultra-clean, concise (Name, Price, Link, Image, Dhaka Time).
  */
 
 // In-memory fallbacks if KV is not yet bound
@@ -21,7 +23,7 @@ export default {
    * Cron Trigger Handler (Runs every 10 minutes)
    */
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(checkAllStores(env));
+    ctx.waitUntil(checkAllStores(env, false));
   },
 
   /**
@@ -165,14 +167,16 @@ function formatDhakaTime(dateStr) {
 }
 
 /**
- * Universal Shopify Catalog Fetcher with Pagination & Rate-Limit Throttling.
+ * Optimized Shopify Catalog Fetcher:
+ * - Routine checks: Scans Page 1 & 2 sorted by `created-descending` (Top 500 newest items).
+ * - Full checks / First run: Scans up to 15 pages to fetch full catalog.
  */
-async function fetchShopifyCollection(baseUrl, refererUrl) {
+async function fetchShopifyCollection(baseUrl, refererUrl, isFullScan = false) {
   const allProducts = [];
-  const maxPages = 15;
+  const maxPages = isFullScan ? 15 : 2; // Routine check only needs top 2 pages (500 items sorted by newest)
 
   for (let page = 1; page <= maxPages; page++) {
-    const url = `${baseUrl}?limit=250&page=${page}`;
+    const url = `${baseUrl}?limit=250&page=${page}&sort_by=created-descending`;
     
     const response = await fetch(url, {
       headers: {
@@ -197,7 +201,7 @@ async function fetchShopifyCollection(baseUrl, refererUrl) {
 
     if (products.length < 250) break;
 
-    await new Promise(r => setTimeout(r, 150));
+    await new Promise(r => setTimeout(r, 100));
   }
 
   return allProducts;
@@ -262,7 +266,7 @@ async function markSingleKeySeen(env, storePrefix, prodId) {
 async function checkAllStores(env, isManual = false) {
   const timestamp = new Date().toISOString();
   let logMessages = [];
-  logMessages.push(`[${timestamp}] Starting multi-store scan...`);
+  logMessages.push(`[${timestamp}] Starting multi-store scan... (Mode: ${isManual ? 'Full Scan' : 'Fast Routine Check'})`);
 
   const webhookUrl = await getActiveWebhookUrl(env);
 
@@ -274,17 +278,19 @@ async function checkAllStores(env, isManual = false) {
   // -------------------------------------------------------------
   try {
     logMessages.push('Fetching Mattel Creations catalog...');
+    const seenMattelIds = await getSeenIdSet(env, 'SEEN_MATTEL_IDS', fallbackMattelIds);
+    const isFirstRun = seenMattelIds.size === 0;
+
+    // Run full scan on first run or manual check, otherwise run fast Page 1 & 2 scan
     const mattelProducts = await fetchShopifyCollection(
       'https://creations.mattel.com/collections/mattel-creations-shop-all/products.json',
-      'https://creations.mattel.com/collections/mattel-creations-shop-all'
+      'https://creations.mattel.com/collections/mattel-creations-shop-all',
+      isFirstRun || isManual
     );
     const mattelVehicles = mattelProducts.filter(isVehicleProduct);
 
     mattelResult.total = mattelProducts.length;
     mattelResult.vehicles = mattelVehicles.length;
-
-    const seenMattelIds = await getSeenIdSet(env, 'SEEN_MATTEL_IDS', fallbackMattelIds);
-    const isFirstRun = seenMattelIds.size === 0;
 
     const currentMattelIds = [];
     const newMattel = [];
@@ -334,16 +340,18 @@ async function checkAllStores(env, isManual = false) {
   // -------------------------------------------------------------
   try {
     logMessages.push('Fetching JCAR Diecast Hot Wheels catalog...');
+    const seenJcarIds = await getSeenIdSet(env, 'SEEN_JCAR_IDS', fallbackJcarIds);
+    const isFirstRun = seenJcarIds.size === 0;
+
+    // Run full scan on first run or manual check, otherwise run fast Page 1 & 2 scan
     const jcarProducts = await fetchShopifyCollection(
       'https://www.jcardiecast.com/collections/hot-wheels/products.json',
-      'https://www.jcardiecast.com/collections/hot-wheels'
+      'https://www.jcardiecast.com/collections/hot-wheels',
+      isFirstRun || isManual
     );
 
     jcarResult.total = jcarProducts.length;
     jcarResult.hotwheels = jcarProducts.length;
-
-    const seenJcarIds = await getSeenIdSet(env, 'SEEN_JCAR_IDS', fallbackJcarIds);
-    const isFirstRun = seenJcarIds.size === 0;
 
     const currentJcarIds = [];
     const newJcar = [];
@@ -783,7 +791,7 @@ function renderDashboard(metrics, env, activeWebhook) {
       <div class="brand-logo">MC + JCAR</div>
       <div>
         <h1>Multi-Store Listing Alert</h1>
-        <p class="subtitle">Bangladesh Dhaka Time (Asia/Dhaka) • Every 10 Minutes</p>
+        <p class="subtitle">Bangladesh Dhaka Time (Asia/Dhaka) • Fast Newest-First Scans</p>
       </div>
     </div>
   </header>
@@ -861,7 +869,7 @@ function renderDashboard(metrics, env, activeWebhook) {
     <div class="console" id="log-console">
 [Timestamp] ${metrics.timestamp || 'No check executed yet'}
 Status: ${metrics.status || 'Idle'}
-Total Items Tracked Across Stores: ${totalTracked}
+Total Items Scanned Across Stores: ${totalTracked}
 Mattel Vehicles: ${mattelVehicles} | JCAR Hot Wheels: ${jcarHotwheels}
 
 Logs:
