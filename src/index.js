@@ -5,7 +5,7 @@
  * 1. Mattel Creations (Vehicles Category) - https://creations.mattel.com/collections/mattel-creations-shop-all
  * 2. JCAR Diecast (Hot Wheels Collection) - https://www.jcardiecast.com/collections/hot-wheels
  * 
- * Duplicate-Proof: Atomic individual KV keys per product ID prevent repeated alerts.
+ * Efficient & Reliable: Single-call master KV array persistence prevents subrequest timeouts.
  * Timezone: Bangladesh Dhaka Time (Asia/Dhaka).
  * Alerts: Ultra-clean, concise (Name, Price, Link, Image, Dhaka Time).
  */
@@ -204,7 +204,7 @@ async function fetchShopifyCollection(baseUrl, refererUrl) {
 }
 
 /**
- * Master set of seen IDs stored in KV array or individual keys.
+ * Read master set of seen IDs from KV array.
  */
 async function getSeenIdSet(env, key, fallbackSet) {
   const seenSet = new Set(fallbackSet);
@@ -221,18 +221,20 @@ async function getSeenIdSet(env, key, fallbackSet) {
 }
 
 /**
- * Save master ID set to KV array and fallback.
+ * Save master ID set to KV array in a single efficient call.
  */
 async function saveSeenIdSet(env, key, idsArray) {
   if (env.LISTING_KV) {
     try {
       await env.LISTING_KV.put(key, JSON.stringify(idsArray));
-    } catch (e) {}
+    } catch (e) {
+      console.error(`Failed to save ${key} to KV:`, e);
+    }
   }
 }
 
 /**
- * Check individual atomic product key to prevent any possible duplicate.
+ * Check single product key in KV.
  */
 async function isSingleKeySeen(env, storePrefix, prodId) {
   if (!env.LISTING_KV) return false;
@@ -245,7 +247,7 @@ async function isSingleKeySeen(env, storePrefix, prodId) {
 }
 
 /**
- * Mark individual atomic product key as seen immediately.
+ * Mark single product key in KV.
  */
 async function markSingleKeySeen(env, storePrefix, prodId) {
   if (!env.LISTING_KV) return;
@@ -301,19 +303,18 @@ async function checkAllStores(env, isManual = false) {
     mattelResult.newCount = newMattel.length;
 
     if (isFirstRun) {
-      logMessages.push(`Mattel First Run: Initialized master database of ${mattelVehicles.length} vehicles.`);
+      logMessages.push(`Mattel First Run: Registered master database of ${mattelVehicles.length} vehicles.`);
       for (const idStr of currentMattelIds) {
         seenMattelIds.add(idStr);
-        await markSingleKeySeen(env, 'MATTEL', idStr);
       }
-      await saveSeenIdSet(env, 'SEEN_MATTEL_IDS', currentMattelIds);
+      await saveSeenIdSet(env, 'SEEN_MATTEL_IDS', Array.from(seenMattelIds));
       fallbackMattelIds = seenMattelIds;
     } else if (newMattel.length > 0) {
       logMessages.push(`Found ${newMattel.length} NEW Mattel vehicle listings!`);
       for (const item of newMattel) {
         const idStr = String(item.id);
         
-        // Mark as seen immediately BEFORE sending alert to prevent duplicate
+        // Mark as seen immediately BEFORE sending alert
         seenMattelIds.add(idStr);
         await markSingleKeySeen(env, 'MATTEL', idStr);
 
@@ -361,19 +362,18 @@ async function checkAllStores(env, isManual = false) {
     jcarResult.newCount = newJcar.length;
 
     if (isFirstRun) {
-      logMessages.push(`JCAR First Run: Initialized master database of ${jcarProducts.length} Hot Wheels.`);
+      logMessages.push(`JCAR First Run: Registered master database of ${jcarProducts.length} Hot Wheels.`);
       for (const idStr of currentJcarIds) {
         seenJcarIds.add(idStr);
-        await markSingleKeySeen(env, 'JCAR', idStr);
       }
-      await saveSeenIdSet(env, 'SEEN_JCAR_IDS', currentJcarIds);
+      await saveSeenIdSet(env, 'SEEN_JCAR_IDS', Array.from(seenJcarIds));
       fallbackJcarIds = seenJcarIds;
     } else if (newJcar.length > 0) {
       logMessages.push(`Found ${newJcar.length} NEW JCAR Hot Wheels listings!`);
       for (const item of newJcar) {
         const idStr = String(item.id);
 
-        // Mark as seen immediately BEFORE sending alert to prevent duplicate
+        // Mark as seen immediately BEFORE sending alert
         seenJcarIds.add(idStr);
         await markSingleKeySeen(env, 'JCAR', idStr);
 
@@ -459,7 +459,7 @@ async function getStatusMetrics(env) {
 }
 
 /**
- * Send Discord Rich Embed for new product alert (Ultra Short, Clean, Bangladesh Dhaka Time).
+ * Send Discord Rich Embed for new product alert.
  */
 async function sendDiscordAlert(webhookUrl, product, storeName, baseUrl, embedColor) {
   if (!webhookUrl) return;
