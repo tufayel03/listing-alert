@@ -8,5 +8,11 @@
     "crons": [
       "*/10 * * * *"
     ]
-  }
+  },
+  "kv_namespaces": [
+    {
+      "binding": "LISTING_KV",
+      "id": "4c0336ba40ff47a09ae1bf814e759ea2"
+    }
+  ]
 }
