@@ -1,13 +1,17 @@
 /**
- * Mattel Creations Vehicle Listing Alert - Cloudflare Worker
+ * Multi-Store Listing Alert - Cloudflare Worker
  * 
- * Automatically checks Mattel Creations every 10 minutes for newly listed vehicles.
- * Paginate across all pages to track ALL 600+ vehicle items.
+ * Monitors:
+ * 1. Mattel Creations (Vehicles Category) - https://creations.mattel.com/collections/mattel-creations-shop-all
+ * 2. JCAR Diecast (Hot Wheels Collection) - https://www.jcardiecast.com/collections/hot-wheels
+ * 
+ * Automatically checks both stores every 10 minutes for newly listed items.
  * Sends Discord notifications via Webhook and persists state in Cloudflare KV.
  */
 
-// In-memory fallback if KV is not yet bound
-let fallbackSeenIds = new Set();
+// In-memory fallbacks if KV is not yet bound
+let fallbackMattelIds = new Set();
+let fallbackJcarIds = new Set();
 let fallbackLastCheck = null;
 let fallbackWebhookUrl = '';
 
@@ -16,7 +20,7 @@ export default {
    * Cron Trigger Handler (Runs every 10 minutes)
    */
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(checkNewVehicles(env));
+    ctx.waitUntil(checkAllStores(env));
   },
 
   /**
@@ -27,7 +31,7 @@ export default {
 
     // API Routes
     if (url.pathname === '/api/check' && request.method === 'POST') {
-      const result = await checkNewVehicles(env, true);
+      const result = await checkAllStores(env, true);
       return new Response(JSON.stringify(result, null, 2), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -49,8 +53,6 @@ export default {
         }
 
         await saveWebhookUrl(env, webhookUrl);
-
-        // Test the webhook immediately
         const testResult = await sendTestDiscordAlert(env);
 
         return new Response(JSON.stringify({
@@ -104,7 +106,7 @@ export default {
 };
 
 /**
- * Get active Discord Webhook URL (prefers KV saved, falls back to env variable or memory).
+ * Get active Discord Webhook URL.
  */
 async function getActiveWebhookUrl(env) {
   if (env.LISTING_KV) {
@@ -120,7 +122,7 @@ async function getActiveWebhookUrl(env) {
 }
 
 /**
- * Save Discord Webhook URL to KV and fallback memory.
+ * Save Discord Webhook URL.
  */
 async function saveWebhookUrl(env, url) {
   if (env.LISTING_KV) {
@@ -138,7 +140,7 @@ async function saveWebhookUrl(env, url) {
 }
 
 /**
- * Mask webhook URL for security display.
+ * Mask webhook URL.
  */
 function maskWebhook(url) {
   if (!url || url.length < 30) return 'Configured';
@@ -146,46 +148,38 @@ function maskWebhook(url) {
 }
 
 /**
- * Fetch ALL products from Mattel Creations by paginating pages.
- * Safe against IP blocking with standard headers and gentle delays.
+ * Universal Shopify Catalog Fetcher with Pagination & Rate-Limit Throttling.
  */
-async function fetchAllProducts() {
+async function fetchShopifyCollection(baseUrl, refererUrl) {
   const allProducts = [];
-  const maxPages = 15; // Up to 3,750 products max
+  const maxPages = 15;
 
   for (let page = 1; page <= maxPages; page++) {
-    const shopifyUrl = `https://creations.mattel.com/collections/mattel-creations-shop-all/products.json?limit=250&page=${page}`;
+    const url = `${baseUrl}?limit=250&page=${page}`;
     
-    const response = await fetch(shopifyUrl, {
+    const response = await fetch(url, {
       headers: {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
         'Accept': 'application/json',
         'Accept-Language': 'en-US,en;q=0.9',
+        'Referer': refererUrl || baseUrl,
         'Cache-Control': 'no-cache'
       }
     });
 
     if (!response.ok) {
-      console.warn(`Page ${page} status: ${response.status}`);
       break;
     }
 
     const data = await response.json();
     const products = data.products || [];
     
-    if (products.length === 0) {
-      // Reached the end of available catalog
-      break;
-    }
+    if (products.length === 0) break;
 
     allProducts.push(...products);
 
-    // If page returned less than 250 items, it's the last page
-    if (products.length < 250) {
-      break;
-    }
+    if (products.length < 250) break;
 
-    // Polite delay between requests to avoid rate limits
     await new Promise(r => setTimeout(r, 150));
   }
 
@@ -193,96 +187,139 @@ async function fetchAllProducts() {
 }
 
 /**
- * Main function to fetch products across ALL pages, filter vehicles, compare with stored state, and send alerts.
+ * Main function to check BOTH Mattel Creations & JCAR Diecast.
  */
-async function checkNewVehicles(env, isManual = false) {
+async function checkAllStores(env, isManual = false) {
   const timestamp = new Date().toISOString();
   let logMessages = [];
-  logMessages.push(`[${timestamp}] Starting Mattel Creations vehicle check...`);
+  logMessages.push(`[${timestamp}] Starting multi-store scan...`);
 
+  const webhookUrl = await getActiveWebhookUrl(env);
+
+  let mattelResult = { total: 0, vehicles: 0, newCount: 0 };
+  let jcarResult = { total: 0, hotwheels: 0, newCount: 0 };
+
+  // -------------------------------------------------------------
+  // 1. SCAN MATTEL CREATIONS (Vehicles Category)
+  // -------------------------------------------------------------
   try {
-    const products = await fetchAllProducts();
-    logMessages.push(`Fetched total catalog: ${products.length} products across all pages.`);
+    logMessages.push('Fetching Mattel Creations catalog...');
+    const mattelProducts = await fetchShopifyCollection(
+      'https://creations.mattel.com/collections/mattel-creations-shop-all/products.json',
+      'https://creations.mattel.com/collections/mattel-creations-shop-all'
+    );
+    const mattelVehicles = mattelProducts.filter(isVehicleProduct);
 
-    // Filter products matching Vehicle category or tag
-    const vehicleProducts = products.filter(isVehicleProduct);
-    logMessages.push(`Found ${vehicleProducts.length} vehicle items in total catalog.`);
+    mattelResult.total = mattelProducts.length;
+    mattelResult.vehicles = mattelVehicles.length;
 
-    // Retrieve previously seen product IDs from KV
-    const seenIds = await getSeenProductIds(env);
-    const isFirstRun = seenIds.size === 0;
+    const seenMattelIds = await getSeenIds(env, 'SEEN_MATTEL_IDS', fallbackMattelIds);
+    const isFirstRun = seenMattelIds.size === 0;
 
-    const newVehicles = [];
-    const currentVehicleIds = [];
+    const newMattel = [];
+    const currentMattelIds = [];
 
-    for (const prod of vehicleProducts) {
+    for (const prod of mattelVehicles) {
       const idStr = String(prod.id);
-      currentVehicleIds.push(idStr);
-
-      if (!isFirstRun && !seenIds.has(idStr)) {
-        newVehicles.push(prod);
+      currentMattelIds.push(idStr);
+      if (!isFirstRun && !seenMattelIds.has(idStr)) {
+        newMattel.push(prod);
       }
     }
 
-    logMessages.push(`New vehicle listings detected: ${newVehicles.length}`);
+    mattelResult.newCount = newMattel.length;
 
-    const webhookUrl = await getActiveWebhookUrl(env);
-
-    // If first run, initialize KV with all existing vehicle IDs and send welcome webhook
     if (isFirstRun) {
-      logMessages.push(`First run initialized: Registered master database of ${vehicleProducts.length} existing vehicles.`);
+      logMessages.push(`Mattel First Run: Saved master list of ${mattelVehicles.length} vehicles.`);
       if (webhookUrl) {
-        await sendFirstRunWebhook(webhookUrl, vehicleProducts.length);
+        await sendFirstRunWebhook(webhookUrl, 'Mattel Creations', mattelVehicles.length);
       }
-    } else if (newVehicles.length > 0) {
-      // Dispatch Discord alerts for each newly discovered vehicle
-      logMessages.push(`Sending Discord alerts for ${newVehicles.length} new vehicles...`);
-      for (const vehicle of newVehicles) {
-        await sendDiscordAlert(webhookUrl, vehicle);
-        logMessages.push(`Alert sent: ${vehicle.title}`);
+    } else if (newMattel.length > 0) {
+      logMessages.push(`Found ${newMattel.length} NEW Mattel vehicle listings!`);
+      for (const item of newMattel) {
+        await sendDiscordAlert(webhookUrl, item, 'Mattel Creations', 'https://creations.mattel.com', 0xFF0044);
+        logMessages.push(`Alert sent for Mattel item: ${item.title}`);
       }
     }
 
-    // Save updated product IDs to KV so they are remembered forever across deploys
-    await saveSeenProductIds(env, currentVehicleIds);
-
-    const metrics = {
-      timestamp,
-      status: 'success',
-      totalProducts: products.length,
-      totalVehicles: vehicleProducts.length,
-      newVehiclesFound: newVehicles.length,
-      isFirstRun,
-      isManual,
-      newVehiclesList: newVehicles.map(v => ({ id: v.id, title: v.title, handle: v.handle })),
-      logs: logMessages
-    };
-
-    await saveMetrics(env, metrics);
-    return metrics;
+    await saveSeenIds(env, 'SEEN_MATTEL_IDS', currentMattelIds);
+    fallbackMattelIds = new Set(currentMattelIds);
 
   } catch (err) {
-    const errorMetrics = {
-      timestamp,
-      status: 'error',
-      error: err.message,
-      logs: logMessages
-    };
-    logMessages.push(`ERROR: ${err.message}`);
-    await saveMetrics(env, errorMetrics);
-    return errorMetrics;
+    logMessages.push(`Mattel Scan Error: ${err.message}`);
   }
+
+  // -------------------------------------------------------------
+  // 2. SCAN JCAR DIECAST (Hot Wheels Collection)
+  // -------------------------------------------------------------
+  try {
+    logMessages.push('Fetching JCAR Diecast Hot Wheels catalog...');
+    const jcarProducts = await fetchShopifyCollection(
+      'https://www.jcardiecast.com/collections/hot-wheels/products.json',
+      'https://www.jcardiecast.com/collections/hot-wheels'
+    );
+
+    jcarResult.total = jcarProducts.length;
+    jcarResult.hotwheels = jcarProducts.length;
+
+    const seenJcarIds = await getSeenIds(env, 'SEEN_JCAR_IDS', fallbackJcarIds);
+    const isFirstRun = seenJcarIds.size === 0;
+
+    const newJcar = [];
+    const currentJcarIds = [];
+
+    for (const prod of jcarProducts) {
+      const idStr = String(prod.id);
+      currentJcarIds.push(idStr);
+      if (!isFirstRun && !seenJcarIds.has(idStr)) {
+        newJcar.push(prod);
+      }
+    }
+
+    jcarResult.newCount = newJcar.length;
+
+    if (isFirstRun) {
+      logMessages.push(`JCAR First Run: Saved master list of ${jcarProducts.length} Hot Wheels.`);
+      if (webhookUrl) {
+        await sendFirstRunWebhook(webhookUrl, 'JCAR Diecast (Hot Wheels)', jcarProducts.length);
+      }
+    } else if (newJcar.length > 0) {
+      logMessages.push(`Found ${newJcar.length} NEW JCAR Hot Wheels listings!`);
+      for (const item of newJcar) {
+        await sendDiscordAlert(webhookUrl, item, 'JCAR Diecast', 'https://www.jcardiecast.com', 0xFF9900);
+        logMessages.push(`Alert sent for JCAR item: ${item.title}`);
+      }
+    }
+
+    await saveSeenIds(env, 'SEEN_JCAR_IDS', currentJcarIds);
+    fallbackJcarIds = new Set(currentJcarIds);
+
+  } catch (err) {
+    logMessages.push(`JCAR Scan Error: ${err.message}`);
+  }
+
+  const metrics = {
+    timestamp,
+    status: 'success',
+    mattel: mattelResult,
+    jcar: jcarResult,
+    totalTracked: mattelResult.vehicles + jcarResult.hotwheels,
+    totalNewFound: mattelResult.newCount + jcarResult.newCount,
+    isManual,
+    logs: logMessages
+  };
+
+  await saveMetrics(env, metrics);
+  return metrics;
 }
 
 /**
- * Determine if a Shopify product belongs to the Vehicles category.
+ * Filter for Mattel vehicle category.
  */
 function isVehicleProduct(product) {
   const tags = (product.tags || []).map(t => String(t).toLowerCase());
   const type = String(product.product_type || '').toLowerCase();
-  const title = String(product.title || '').toLowerCase();
 
-  // Check tags for category: vehicles
   const hasVehicleTag = tags.some(t => 
     t === 'category: vehicles' || 
     t.includes('vehicles') || 
@@ -297,52 +334,45 @@ function isVehicleProduct(product) {
 }
 
 /**
- * Get seen product IDs from Cloudflare KV or fallback.
+ * Get seen IDs from KV.
  */
-async function getSeenProductIds(env) {
+async function getSeenIds(env, key, fallbackSet) {
   if (env.LISTING_KV) {
     try {
-      const data = await env.LISTING_KV.get('SEEN_VEHICLES_IDS', { type: 'json' });
+      const data = await env.LISTING_KV.get(key, { type: 'json' });
       if (Array.isArray(data)) {
         return new Set(data.map(String));
       }
-    } catch (e) {
-      console.error('Failed to read from KV:', e);
-    }
+    } catch (e) {}
   }
-  return fallbackSeenIds;
+  return fallbackSet;
 }
 
 /**
- * Save seen product IDs to Cloudflare KV or fallback.
+ * Save seen IDs to KV.
  */
-async function saveSeenProductIds(env, idsArray) {
+async function saveSeenIds(env, key, idsArray) {
   if (env.LISTING_KV) {
     try {
-      await env.LISTING_KV.put('SEEN_VEHICLES_IDS', JSON.stringify(idsArray));
-    } catch (e) {
-      console.error('Failed to write to KV:', e);
-    }
+      await env.LISTING_KV.put(key, JSON.stringify(idsArray));
+    } catch (e) {}
   }
-  fallbackSeenIds = new Set(idsArray.map(String));
 }
 
 /**
- * Save last check execution metrics to KV.
+ * Save check metrics to KV.
  */
 async function saveMetrics(env, metrics) {
   if (env.LISTING_KV) {
     try {
       await env.LISTING_KV.put('LAST_CHECK_METRICS', JSON.stringify(metrics));
-    } catch (e) {
-      console.error('Failed to save metrics to KV:', e);
-    }
+    } catch (e) {}
   }
   fallbackLastCheck = metrics;
 }
 
 /**
- * Get status metrics for GUI.
+ * Get status metrics.
  */
 async function getStatusMetrics(env) {
   let metrics = null;
@@ -355,8 +385,10 @@ async function getStatusMetrics(env) {
     metrics = fallbackLastCheck || {
       status: 'idle',
       timestamp: 'Never checked yet',
-      totalVehicles: 0,
-      newVehiclesFound: 0
+      totalTracked: 0,
+      totalNewFound: 0,
+      mattel: { vehicles: 0 },
+      jcar: { hotwheels: 0 }
     };
   }
   return metrics;
@@ -365,10 +397,10 @@ async function getStatusMetrics(env) {
 /**
  * Send Discord Rich Embed for new product alert.
  */
-async function sendDiscordAlert(webhookUrl, product) {
+async function sendDiscordAlert(webhookUrl, product, storeName, baseUrl, embedColor) {
   if (!webhookUrl) return;
 
-  const productUrl = `https://creations.mattel.com/products/${product.handle}`;
+  const productUrl = `${baseUrl}/products/${product.handle}`;
   const firstImage = product.images && product.images.length > 0 ? product.images[0].src : null;
   const firstVariant = product.variants && product.variants.length > 0 ? product.variants[0] : null;
 
@@ -376,18 +408,18 @@ async function sendDiscordAlert(webhookUrl, product) {
   const availabilityStr = firstVariant && firstVariant.available ? '🟢 In Stock' : '🔴 Sold Out / Pre-Order';
 
   const embed = {
-    title: `🚨 NEW VEHICLE LISTED: ${product.title}`,
+    title: `🚨 NEW LISTING: ${product.title}`,
     url: productUrl,
-    color: 0xFF0044, // Hot Wheels Red
-    description: `A new vehicle has just been listed on Mattel Creations!`,
+    color: embedColor || 0xFF0044,
+    description: `A new item has just been listed on **${storeName}**!`,
     fields: [
+      { name: '🏪 Store', value: storeName, inline: true },
       { name: '💰 Price', value: priceStr, inline: true },
-      { name: '📦 Availability', value: availabilityStr, inline: true },
-      { name: '🏷️ Category', value: 'Vehicles', inline: true },
+      { name: '📦 Status', value: availabilityStr, inline: true },
       { name: '🕒 Published', value: product.published_at ? new Date(product.published_at).toLocaleString() : 'Just now', inline: false }
     ],
     footer: {
-      text: 'Mattel Creations Vehicle Monitor • Every 10 min check'
+      text: `${storeName} Listing Alert • Cloudflare Worker`
     },
     timestamp: new Date().toISOString()
   };
@@ -397,8 +429,7 @@ async function sendDiscordAlert(webhookUrl, product) {
   }
 
   const payload = {
-    username: 'Mattel Vehicle Alert',
-    avatar_url: 'https://cdn.shopify.com/s/files/1/0568/1132/3565/files/mc_logo.png',
+    username: `${storeName} Alert`,
     embeds: [embed]
   };
 
@@ -410,16 +441,16 @@ async function sendDiscordAlert(webhookUrl, product) {
 }
 
 /**
- * Send initialization notification to Discord when monitor starts up for the first time.
+ * Send welcome webhook when store monitor initializes.
  */
-async function sendFirstRunWebhook(webhookUrl, vehicleCount) {
+async function sendFirstRunWebhook(webhookUrl, storeName, count) {
   if (!webhookUrl) return;
 
   const embed = {
-    title: '✅ Mattel Vehicle Alert Initialized',
-    description: `Monitor successfully active! Scanned and saved **${vehicleCount}** existing vehicles to the master database. Checks execute automatically every 10 minutes.`,
+    title: `✅ ${storeName} Monitor Initialized`,
+    description: `Monitor successfully active! Scanned and saved **${count}** existing items to the master database. Checks run every 10 minutes.`,
     color: 0x00D2FF,
-    footer: { text: 'Mattel Creations Vehicle Monitor' },
+    footer: { text: 'Multi-Store Listing Alert' },
     timestamp: new Date().toISOString()
   };
 
@@ -431,24 +462,25 @@ async function sendFirstRunWebhook(webhookUrl, vehicleCount) {
 }
 
 /**
- * Send test embed to Discord.
+ * Send test embed.
  */
 async function sendTestDiscordAlert(env) {
   const webhookUrl = await getActiveWebhookUrl(env);
 
   if (!webhookUrl) {
-    return { success: false, error: 'Discord Webhook URL is not set. Please paste your Discord Webhook URL in the form below and click Save Webhook!' };
+    return { success: false, error: 'Discord Webhook URL is not set. Please paste your Discord Webhook URL in the input box and click Save Webhook!' };
   }
 
   const embed = {
-    title: '🔔 Test Alert - Mattel Vehicle Monitor',
-    description: 'This is a test notification from your Cloudflare Worker vehicle monitor. Discord webhook is working perfectly!',
+    title: '🔔 Test Alert - Multi-Store Listing Monitor',
+    description: 'This is a test notification from your Cloudflare Worker monitor. Discord webhook is working perfectly for both Mattel Creations and JCAR Diecast!',
     color: 0x00FF88,
     fields: [
-      { name: 'Status', value: 'Active', inline: true },
-      { name: 'Schedule', value: 'Every 10 Minutes', inline: true }
+      { name: 'Mattel Creations', value: 'Active (Vehicles)', inline: true },
+      { name: 'JCAR Diecast', value: 'Active (Hot Wheels)', inline: true },
+      { name: 'Schedule', value: 'Every 10 Minutes', inline: false }
     ],
-    footer: { text: 'Mattel Vehicle Alert Setup Test' },
+    footer: { text: 'Multi-Store Alert Setup Test' },
     timestamp: new Date().toISOString()
   };
 
@@ -470,19 +502,23 @@ async function sendTestDiscordAlert(env) {
 }
 
 /**
- * Render Modern HTML Dashboard GUI for Cloudflare Worker URL
+ * Render HTML Dashboard.
  */
 function renderDashboard(metrics, env, activeWebhook) {
   const hasWebhook = Boolean(activeWebhook);
   const maskedWebhookStr = activeWebhook ? maskWebhook(activeWebhook) : '';
   const hasKV = Boolean(env.LISTING_KV);
 
+  const mattelVehicles = metrics.mattel ? metrics.mattel.vehicles : (metrics.totalVehicles || 0);
+  const jcarHotwheels = metrics.jcar ? metrics.jcar.hotwheels : 0;
+  const totalTracked = metrics.totalTracked || (mattelVehicles + jcarHotwheels);
+
   return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Mattel Creations - Vehicle Alert Dashboard</title>
+  <title>Multi-Store Listing Alert Dashboard</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
@@ -529,7 +565,7 @@ function renderDashboard(metrics, env, activeWebhook) {
     }
 
     .brand-logo {
-      background: linear-gradient(135deg, #ff0044, #ff5500);
+      background: linear-gradient(135deg, #ff0044, #ff9900);
       color: white;
       font-family: 'Outfit', sans-serif;
       font-weight: 800;
@@ -561,7 +597,7 @@ function renderDashboard(metrics, env, activeWebhook) {
 
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 1.25rem;
       margin-bottom: 2rem;
     }
@@ -608,7 +644,6 @@ function renderDashboard(metrics, env, activeWebhook) {
 
     .badge-success { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
     .badge-warning { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
-    .badge-danger { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
 
     .webhook-box {
       background: var(--card-bg);
@@ -616,15 +651,6 @@ function renderDashboard(metrics, env, activeWebhook) {
       border-radius: 16px;
       padding: 1.5rem;
       margin-bottom: 2rem;
-    }
-
-    .webhook-box h3 {
-      font-family: 'Outfit', sans-serif;
-      font-size: 1.1rem;
-      margin-bottom: 0.5rem;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
     }
 
     .input-group {
@@ -645,11 +671,6 @@ function renderDashboard(metrics, env, activeWebhook) {
       font-family: 'Inter', sans-serif;
       font-size: 0.95rem;
       outline: none;
-      transition: border-color 0.2s ease;
-    }
-
-    .input-field:focus {
-      border-color: var(--accent);
     }
 
     .actions {
@@ -662,14 +683,14 @@ function renderDashboard(metrics, env, activeWebhook) {
     .btn {
       font-family: 'Outfit', sans-serif;
       font-weight: 600;
-      font-size: 1rem;
-      padding: 0.85rem 1.6rem;
+      font-size: 0.95rem;
+      padding: 0.85rem 1.4rem;
       border-radius: 12px;
       border: none;
       cursor: pointer;
       display: inline-flex;
       align-items: center;
-      gap: 0.6rem;
+      gap: 0.5rem;
       transition: all 0.2s ease;
       text-decoration: none;
     }
@@ -680,40 +701,15 @@ function renderDashboard(metrics, env, activeWebhook) {
       box-shadow: 0 4px 20px var(--primary-glow);
     }
 
-    .btn-primary:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 6px 24px var(--primary-glow);
-    }
-
     .btn-accent {
       background: linear-gradient(135deg, #00d2ff, #0088ff);
       color: white;
-      box-shadow: 0 4px 15px rgba(0, 210, 255, 0.3);
-    }
-
-    .btn-accent:hover {
-      transform: translateY(-2px);
     }
 
     .btn-secondary {
       background: rgba(255, 255, 255, 0.08);
       color: var(--text);
       border: 1px solid var(--card-border);
-    }
-
-    .btn-secondary:hover {
-      background: rgba(255, 255, 255, 0.14);
-      transform: translateY(-2px);
-    }
-
-    .section-title {
-      font-family: 'Outfit', sans-serif;
-      font-size: 1.25rem;
-      font-weight: 600;
-      margin-bottom: 1rem;
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
     }
 
     .console {
@@ -727,17 +723,6 @@ function renderDashboard(metrics, env, activeWebhook) {
       max-height: 250px;
       overflow-y: auto;
       line-height: 1.6;
-    }
-
-    .kv-notice {
-      background: rgba(245, 158, 11, 0.1);
-      border: 1px solid rgba(245, 158, 11, 0.3);
-      color: #fbbf24;
-      padding: 1rem 1.25rem;
-      border-radius: 12px;
-      margin-bottom: 1.5rem;
-      font-size: 0.9rem;
-      line-height: 1.5;
     }
 
     #output-toast {
@@ -761,26 +746,16 @@ function renderDashboard(metrics, env, activeWebhook) {
 
   <header>
     <div class="brand">
-      <div class="brand-logo">MC</div>
+      <div class="brand-logo">MC + JCAR</div>
       <div>
-        <h1>Mattel Vehicle Listing Alert</h1>
-        <p class="subtitle">Cloudflare Worker • Automatic 10-Minute Cron Checks</p>
+        <h1>Multi-Store Listing Alert</h1>
+        <p class="subtitle">Monitoring Mattel Creations & JCAR Diecast • Every 10 Minutes</p>
       </div>
     </div>
   </header>
 
   <main>
     <div id="output-toast"></div>
-
-    ${!hasKV ? `
-    <div class="kv-notice">
-      <strong>⚠️ Cloudflare KV Binding Recommended for Permanent Persistence:</strong><br/>
-      Currently running in temporary memory fallback. To make your Webhook URL & Master Vehicle List stay saved permanently across code redeploys:<br/>
-      1. Open Cloudflare Workers -> <strong>listing-alert</strong> -> <strong>Settings</strong> -> <strong>Variables and Secrets</strong>.<br/>
-      2. Under <strong>KV Namespace Bindings</strong>, click <strong>Add binding</strong>: Name = <code>LISTING_KV</code>, Namespace = <em>Select your KV Namespace</em>.<br/>
-      3. Alternatively, set <code>DISCORD_WEBHOOK_URL</code> as a Secret Variable in the same settings page!
-    </div>
-    ` : ''}
 
     <div class="grid">
       <div class="card">
@@ -791,18 +766,15 @@ function renderDashboard(metrics, env, activeWebhook) {
       </div>
 
       <div class="card">
-        <div class="card-title">Tracked Vehicles</div>
-        <div class="card-value">${metrics.totalVehicles || 0}</div>
-        <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem;">Out of ${metrics.totalProducts || 0} catalog items</div>
+        <div class="card-title">Mattel Vehicles</div>
+        <div class="card-value">${mattelVehicles}</div>
+        <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem;">Mattel Creations Store</div>
       </div>
 
       <div class="card">
-        <div class="card-title">Discord Webhook</div>
-        <div style="margin-top: 0.5rem;">
-          ${hasWebhook 
-            ? `<span class="badge badge-success">✓ Active (${maskedWebhookStr})</span>` 
-            : '<span class="badge badge-warning">⚠ Not Set (Paste Below)</span>'}
-        </div>
+        <div class="card-title">JCAR Hot Wheels</div>
+        <div class="card-value">${jcarHotwheels}</div>
+        <div style="font-size: 0.75rem; color: var(--text-muted); margin-top: 0.25rem;">JCAR Diecast Store</div>
       </div>
 
       <div class="card">
@@ -817,9 +789,9 @@ function renderDashboard(metrics, env, activeWebhook) {
 
     <!-- Webhook GUI Input Box -->
     <div class="webhook-box">
-      <h3>🔔 Set Discord Webhook URL</h3>
+      <h3>🔔 Discord Webhook URL</h3>
       <p style="color: var(--text-muted); font-size: 0.9rem;">
-        Paste your Discord Webhook URL below and click <strong>Save & Verify Webhook</strong>.
+        Paste your Discord Webhook URL below to receive new listing notifications for both stores.
       </p>
       <div class="input-group">
         <input 
@@ -838,13 +810,16 @@ function renderDashboard(metrics, env, activeWebhook) {
 
     <div class="actions">
       <button class="btn btn-primary" onclick="runManualCheck()">
-        ⚡ Run Check Now (Scan All Pages)
+        ⚡ Run Check Now (Both Stores)
       </button>
       <button class="btn btn-secondary" onclick="sendTestDiscord()">
         🔔 Test Discord Webhook
       </button>
       <a href="https://creations.mattel.com/collections/mattel-creations-shop-all?#filter.tags_category=Vehicles" target="_blank" rel="noopener" class="btn btn-secondary">
-        🔗 View Mattel Vehicles Store
+        🔗 Mattel Store
+      </a>
+      <a href="https://www.jcardiecast.com/collections/hot-wheels" target="_blank" rel="noopener" class="btn btn-secondary">
+        🔗 JCAR Hot Wheels Store
       </a>
     </div>
 
@@ -852,9 +827,8 @@ function renderDashboard(metrics, env, activeWebhook) {
     <div class="console" id="log-console">
 [Timestamp] ${metrics.timestamp || 'No check executed yet'}
 Status: ${metrics.status || 'Idle'}
-Total Products Scanned: ${metrics.totalProducts || 0}
-Total Vehicles Found: ${metrics.totalVehicles || 0}
-New Vehicles Found: ${metrics.newVehiclesFound || 0}
+Total Items Tracked Across Stores: ${totalTracked}
+Mattel Vehicles: ${mattelVehicles} | JCAR Hot Wheels: ${jcarHotwheels}
 
 Logs:
 ${(metrics.logs || ['Waiting for first run...']).join('\n')}
@@ -862,7 +836,7 @@ ${(metrics.logs || ['Waiting for first run...']).join('\n')}
   </main>
 
   <footer>
-    Mattel Creations Vehicle Monitor • Powered by Cloudflare Workers
+    Multi-Store Listing Monitor • Mattel Creations & JCAR Diecast
   </footer>
 
   <script>
@@ -927,14 +901,14 @@ ${(metrics.logs || ['Waiting for first run...']).join('\n')}
       const consoleEl = document.getElementById('log-console');
       toast.style.display = 'block';
       toast.className = 'badge-warning';
-      toast.innerText = '⏳ Scanning all pages on Mattel Creations... Please wait...';
+      toast.innerText = '⏳ Scanning both Mattel Creations and JCAR Diecast... Please wait...';
 
       try {
         const res = await fetch('/api/check', { method: 'POST' });
         const data = await res.json();
         
         toast.className = data.status === 'success' ? 'badge-success' : 'badge-danger';
-        toast.innerText = 'Scan completed! Total vehicles tracked: ' + (data.totalVehicles || 0) + ' | New found: ' + (data.newVehiclesFound || 0);
+        toast.innerText = 'Scan completed! Mattel: ' + (data.mattel ? data.mattel.vehicles : 0) + ' items | JCAR: ' + (data.jcar ? data.jcar.hotwheels : 0) + ' items';
 
         consoleEl.innerText = JSON.stringify(data, null, 2);
         setTimeout(() => location.reload(), 3000);
