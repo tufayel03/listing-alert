@@ -8,6 +8,7 @@
 // In-memory fallback if KV is not yet bound in development
 let fallbackSeenIds = new Set();
 let fallbackLastCheck = null;
+let fallbackWebhookUrl = '';
 
 export default {
   /**
@@ -31,6 +32,45 @@ export default {
       });
     }
 
+    if (url.pathname === '/api/save-webhook' && request.method === 'POST') {
+      try {
+        const body = await request.json();
+        const webhookUrl = body.webhookUrl ? body.webhookUrl.trim() : '';
+
+        if (!webhookUrl || !webhookUrl.startsWith('https://discord.com/api/webhooks/')) {
+          return new Response(JSON.stringify({ success: false, error: 'Invalid Discord Webhook URL format. Must start with https://discord.com/api/webhooks/' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' }
+          });
+        }
+
+        await saveWebhookUrl(env, webhookUrl);
+
+        // Test the webhook immediately
+        const testResult = await sendTestDiscordAlert(env);
+
+        return new Response(JSON.stringify({
+          success: true,
+          message: 'Webhook saved and verified successfully!',
+          testResult
+        }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      } catch (err) {
+        return new Response(JSON.stringify({ success: false, error: err.message }), {
+          status: 500,
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+    }
+
+    if (url.pathname === '/api/clear-webhook' && request.method === 'POST') {
+      await saveWebhookUrl(env, '');
+      return new Response(JSON.stringify({ success: true, message: 'Webhook cleared.' }), {
+        headers: { 'Content-Type': 'application/json' }
+      });
+    }
+
     if (url.pathname === '/api/test-discord' && request.method === 'POST') {
       const result = await sendTestDiscordAlert(env);
       return new Response(JSON.stringify(result, null, 2), {
@@ -40,18 +80,66 @@ export default {
 
     if (url.pathname === '/api/status') {
       const metrics = await getStatusMetrics(env);
-      return new Response(JSON.stringify(metrics, null, 2), {
+      const activeWebhook = await getActiveWebhookUrl(env);
+      return new Response(JSON.stringify({
+        ...metrics,
+        hasWebhook: Boolean(activeWebhook),
+        maskedWebhook: activeWebhook ? maskWebhook(activeWebhook) : ''
+      }, null, 2), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
     // Serve HTML Dashboard for all browser requests
-    const html = renderDashboard(await getStatusMetrics(env), env);
+    const activeWebhook = await getActiveWebhookUrl(env);
+    const html = renderDashboard(await getStatusMetrics(env), env, activeWebhook);
     return new Response(html, {
       headers: { 'Content-Type': 'text/html; charset=utf-8' }
     });
   }
 };
+
+/**
+ * Get active Discord Webhook URL (prefers KV saved, falls back to env variable or memory).
+ */
+async function getActiveWebhookUrl(env) {
+  if (env.LISTING_KV) {
+    try {
+      const kvWebhook = await env.LISTING_KV.get('SAVED_WEBHOOK_URL');
+      if (kvWebhook && kvWebhook.trim()) return kvWebhook.trim();
+    } catch (e) {}
+  }
+  if (env.DISCORD_WEBHOOK_URL && env.DISCORD_WEBHOOK_URL.trim()) {
+    return env.DISCORD_WEBHOOK_URL.trim();
+  }
+  return fallbackWebhookUrl;
+}
+
+/**
+ * Save Discord Webhook URL to KV and fallback memory.
+ */
+async function saveWebhookUrl(env, url) {
+  if (env.LISTING_KV) {
+    try {
+      if (url) {
+        await env.LISTING_KV.put('SAVED_WEBHOOK_URL', url);
+      } else {
+        await env.LISTING_KV.delete('SAVED_WEBHOOK_URL');
+      }
+    } catch (e) {
+      console.error('Failed to save webhook to KV:', e);
+    }
+  }
+  fallbackWebhookUrl = url;
+}
+
+/**
+ * Mask webhook URL for security display.
+ */
+function maskWebhook(url) {
+  if (!url || url.length < 30) return 'Configured';
+  return url.substring(0, 33) + '...' + url.substring(url.length - 6);
+}
 
 /**
  * Main function to fetch products, filter vehicles, compare with stored state, and send alerts.
@@ -101,16 +189,18 @@ async function checkNewVehicles(env, isManual = false) {
 
     logMessages.push(`New vehicle listings detected: ${newVehicles.length}`);
 
+    const webhookUrl = await getActiveWebhookUrl(env);
+
     // If first run, initialize KV with current IDs and send welcome webhook if configured
     if (isFirstRun) {
       logMessages.push('First run initialized. Saved current vehicle list to state.');
-      if (env.DISCORD_WEBHOOK_URL) {
-        await sendFirstRunWebhook(env, vehicleProducts.length);
+      if (webhookUrl) {
+        await sendFirstRunWebhook(webhookUrl, vehicleProducts.length);
       }
     } else if (newVehicles.length > 0) {
       // Dispatch Discord alerts for each new vehicle found
       for (const vehicle of newVehicles) {
-        await sendDiscordAlert(env, vehicle);
+        await sendDiscordAlert(webhookUrl, vehicle);
       }
     }
 
@@ -151,7 +241,6 @@ async function checkNewVehicles(env, isManual = false) {
 function isVehicleProduct(product) {
   const tags = (product.tags || []).map(t => String(t).toLowerCase());
   const type = String(product.product_type || '').toLowerCase();
-  const title = String(product.title || '').toLowerCase();
 
   // Check tags for category: vehicles
   const hasVehicleTag = tags.some(t => 
@@ -162,8 +251,6 @@ function isVehicleProduct(product) {
   );
 
   if (hasVehicleTag) return true;
-
-  // Fallback checks
   if (type.includes('vehicle') || type.includes('diecast')) return true;
 
   return false;
@@ -238,11 +325,8 @@ async function getStatusMetrics(env) {
 /**
  * Send Discord Rich Embed for new product alert.
  */
-async function sendDiscordAlert(env, product) {
-  if (!env.DISCORD_WEBHOOK_URL) {
-    console.warn('DISCORD_WEBHOOK_URL is not configured!');
-    return;
-  }
+async function sendDiscordAlert(webhookUrl, product) {
+  if (!webhookUrl) return;
 
   const productUrl = `https://creations.mattel.com/products/${product.handle}`;
   const firstImage = product.images && product.images.length > 0 ? product.images[0].src : null;
@@ -278,7 +362,7 @@ async function sendDiscordAlert(env, product) {
     embeds: [embed]
   };
 
-  await fetch(env.DISCORD_WEBHOOK_URL, {
+  await fetch(webhookUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
@@ -288,8 +372,8 @@ async function sendDiscordAlert(env, product) {
 /**
  * Send initialization notification to Discord when monitor starts up for the first time.
  */
-async function sendFirstRunWebhook(env, vehicleCount) {
-  if (!env.DISCORD_WEBHOOK_URL) return;
+async function sendFirstRunWebhook(webhookUrl, vehicleCount) {
+  if (!webhookUrl) return;
 
   const embed = {
     title: '✅ Mattel Vehicle Alert Initialized',
@@ -299,7 +383,7 @@ async function sendFirstRunWebhook(env, vehicleCount) {
     timestamp: new Date().toISOString()
   };
 
-  await fetch(env.DISCORD_WEBHOOK_URL, {
+  await fetch(webhookUrl, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ embeds: [embed] })
@@ -310,8 +394,10 @@ async function sendFirstRunWebhook(env, vehicleCount) {
  * Send test embed to Discord.
  */
 async function sendTestDiscordAlert(env) {
-  if (!env.DISCORD_WEBHOOK_URL) {
-    return { success: false, error: 'DISCORD_WEBHOOK_URL secret is not set in Cloudflare Worker environment variables.' };
+  const webhookUrl = await getActiveWebhookUrl(env);
+
+  if (!webhookUrl) {
+    return { success: false, error: 'Discord Webhook URL is not set. Please paste your Discord Webhook URL in the form below and click Save Webhook!' };
   }
 
   const embed = {
@@ -327,14 +413,14 @@ async function sendTestDiscordAlert(env) {
   };
 
   try {
-    const res = await fetch(env.DISCORD_WEBHOOK_URL, {
+    const res = await fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ embeds: [embed] })
     });
 
     if (!res.ok) {
-      throw new Error(`Discord API status ${res.status}`);
+      throw new Error(`Discord API returned status ${res.status}`);
     }
 
     return { success: true, message: 'Test message sent to Discord successfully!' };
@@ -346,8 +432,9 @@ async function sendTestDiscordAlert(env) {
 /**
  * Render Modern HTML Dashboard GUI for Cloudflare Worker URL
  */
-function renderDashboard(metrics, env) {
-  const hasWebhook = Boolean(env.DISCORD_WEBHOOK_URL);
+function renderDashboard(metrics, env, activeWebhook) {
+  const hasWebhook = Boolean(activeWebhook);
+  const maskedWebhookStr = activeWebhook ? maskWebhook(activeWebhook) : '';
   const hasKV = Boolean(env.LISTING_KV);
 
   return `<!DOCTYPE html>
@@ -483,6 +570,48 @@ function renderDashboard(metrics, env) {
     .badge-warning { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
     .badge-danger { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
 
+    .webhook-box {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 16px;
+      padding: 1.5rem;
+      margin-bottom: 2rem;
+    }
+
+    .webhook-box h3 {
+      font-family: 'Outfit', sans-serif;
+      font-size: 1.1rem;
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+
+    .input-group {
+      display: flex;
+      gap: 0.75rem;
+      margin-top: 1rem;
+      flex-wrap: wrap;
+    }
+
+    .input-field {
+      flex: 1;
+      min-width: 300px;
+      background: rgba(0, 0, 0, 0.35);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 0.85rem 1rem;
+      color: #fff;
+      font-family: 'Inter', sans-serif;
+      font-size: 0.95rem;
+      outline: none;
+      transition: border-color 0.2s ease;
+    }
+
+    .input-field:focus {
+      border-color: var(--accent);
+    }
+
     .actions {
       display: flex;
       gap: 1rem;
@@ -514,6 +643,16 @@ function renderDashboard(metrics, env) {
     .btn-primary:hover {
       transform: translateY(-2px);
       box-shadow: 0 6px 24px var(--primary-glow);
+    }
+
+    .btn-accent {
+      background: linear-gradient(135deg, #00d2ff, #0088ff);
+      color: white;
+      box-shadow: 0 4px 15px rgba(0, 210, 255, 0.3);
+    }
+
+    .btn-accent:hover {
+      transform: translateY(-2px);
     }
 
     .btn-secondary {
@@ -548,34 +687,6 @@ function renderDashboard(metrics, env) {
       max-height: 250px;
       overflow-y: auto;
       line-height: 1.6;
-    }
-
-    .instructions {
-      background: var(--card-bg);
-      border: 1px solid var(--card-border);
-      border-radius: 16px;
-      padding: 1.5rem;
-      margin-top: 2rem;
-    }
-
-    .instructions h3 {
-      font-family: 'Outfit', sans-serif;
-      font-size: 1.1rem;
-      margin-bottom: 0.75rem;
-      color: var(--accent);
-    }
-
-    .instructions ol {
-      margin-left: 1.25rem;
-      line-height: 1.7;
-      color: var(--text-muted);
-    }
-
-    .instructions code {
-      background: rgba(255, 255, 255, 0.1);
-      padding: 0.2rem 0.4rem;
-      border-radius: 4px;
-      color: #fff;
     }
 
     #output-toast {
@@ -627,8 +738,8 @@ function renderDashboard(metrics, env) {
         <div class="card-title">Discord Webhook</div>
         <div style="margin-top: 0.5rem;">
           ${hasWebhook 
-            ? '<span class="badge badge-success">✓ Configured</span>' 
-            : '<span class="badge badge-warning">⚠ Not Set (Set in Worker Vars)</span>'}
+            ? `<span class="badge badge-success">✓ Active (${maskedWebhookStr})</span>` 
+            : '<span class="badge badge-warning">⚠ Not Set (Paste Below)</span>'}
         </div>
       </div>
 
@@ -639,6 +750,27 @@ function renderDashboard(metrics, env) {
             ? '<span class="badge badge-success">✓ LISTING_KV Bound</span>' 
             : '<span class="badge badge-warning">⚠ In-Memory Fallback</span>'}
         </div>
+      </div>
+    </div>
+
+    <!-- Webhook GUI Input Box -->
+    <div class="webhook-box">
+      <h3>🔔 Set Discord Webhook URL</h3>
+      <p style="color: var(--text-muted); font-size: 0.9rem;">
+        Paste your Discord Webhook URL below and click <strong>Save & Verify Webhook</strong>. It will save directly and send a test alert!
+      </p>
+      <div class="input-group">
+        <input 
+          type="url" 
+          id="webhook-input" 
+          class="input-field" 
+          placeholder="https://discord.com/api/webhooks/123456789/abcxyz..."
+          value="${activeWebhook || ''}"
+        />
+        <button class="btn btn-accent" onclick="saveWebhook()">
+          💾 Save & Verify Webhook
+        </button>
+        ${hasWebhook ? `<button class="btn btn-secondary" onclick="clearWebhook()">🗑️ Clear</button>` : ''}
       </div>
     </div>
 
@@ -665,16 +797,6 @@ New Vehicles Found: ${metrics.newVehiclesFound || 0}
 Logs:
 ${(metrics.logs || ['Waiting for first run...']).join('\n')}
     </div>
-
-    <div class="instructions">
-      <h3>⚙️ Cloudflare Worker Deployment Setup Checklist</h3>
-      <ol>
-        <li>In Cloudflare Dashboard, go to your Worker <strong>Settings -> Variables</strong>.</li>
-        <li>Add a secret named <code>DISCORD_WEBHOOK_URL</code> with your Discord Webhook URL.</li>
-        <li>Go to <strong>KV Namespaces</strong>, create a namespace named <code>LISTING_KV</code>, and bind it to your Worker in settings with variable name <code>LISTING_KV</code>.</li>
-        <li>Cron Trigger is set to <code>*/10 * * * *</code> (every 10 minutes). When your PC is off, Cloudflare will check automatically in the cloud and send Discord alerts instantly!</li>
-      </ol>
-    </div>
   </main>
 
   <footer>
@@ -682,6 +804,62 @@ ${(metrics.logs || ['Waiting for first run...']).join('\n')}
   </footer>
 
   <script>
+    async function saveWebhook() {
+      const input = document.getElementById('webhook-input');
+      const toast = document.getElementById('output-toast');
+      const url = input.value.trim();
+
+      if (!url) {
+        toast.style.display = 'block';
+        toast.className = 'badge-danger';
+        toast.innerText = 'Please paste a valid Discord Webhook URL!';
+        return;
+      }
+
+      toast.style.display = 'block';
+      toast.className = 'badge-warning';
+      toast.innerText = '⏳ Saving Webhook and sending test alert...';
+
+      try {
+        const res = await fetch('/api/save-webhook', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ webhookUrl: url })
+        });
+        const data = await res.json();
+
+        if (data.success) {
+          toast.className = 'badge-success';
+          toast.innerText = '✅ Webhook saved successfully! Test notification sent to Discord.';
+          setTimeout(() => location.reload(), 2000);
+        } else {
+          toast.className = 'badge-danger';
+          toast.innerText = '❌ Failed: ' + data.error;
+        }
+      } catch (err) {
+        toast.className = 'badge-danger';
+        toast.innerText = 'Error saving webhook: ' + err.message;
+      }
+    }
+
+    async function clearWebhook() {
+      if (!confirm('Are you sure you want to remove the Discord Webhook URL?')) return;
+      const toast = document.getElementById('output-toast');
+      toast.style.display = 'block';
+      toast.className = 'badge-warning';
+      toast.innerText = '⏳ Clearing Webhook...';
+
+      try {
+        await fetch('/api/clear-webhook', { method: 'POST' });
+        toast.className = 'badge-success';
+        toast.innerText = 'Webhook cleared!';
+        setTimeout(() => location.reload(), 1500);
+      } catch (err) {
+        toast.className = 'badge-danger';
+        toast.innerText = 'Error clearing webhook: ' + err.message;
+      }
+    }
+
     async function runManualCheck() {
       const toast = document.getElementById('output-toast');
       const consoleEl = document.getElementById('log-console');
