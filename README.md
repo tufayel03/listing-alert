@@ -32,9 +32,6 @@ Because it runs entirely on Cloudflare's Edge network, **it runs 24/7 even when 
 git clone https://github.com/tufayel03/listing-alert.git
 cd listing-alert
 
-# Install Wrangler CLI locally if needed
-npm install
-
 # Run locally
 npm run dev
 ```
@@ -49,9 +46,8 @@ Run the deploy command from your terminal:
 ```bash
 npx wrangler deploy
 ```
-*(Wrangler will ask you to log in to Cloudflare in your browser if you haven't already).*
 
-#### Step B: Set Your Discord Webhook URL (Secret)
+#### Step B: Set Your Discord Webhook URL (Secret) in Cloudflare GUI
 1. Go to [Cloudflare Dashboard](https://dash.cloudflare.com/) -> **Workers & Pages**.
 2. Click on **`listing-alert`**.
 3. Go to **Settings** -> **Variables and Secrets**.
@@ -60,14 +56,16 @@ npx wrangler deploy
    - **Value**: Your Discord Webhook URL (e.g., `https://discord.com/api/webhooks/...`)
 5. Click **Save and Deploy**.
 
-#### Step C: Create & Bind KV Namespace (For Persisting Seen Vehicles)
+#### Step C: Bind KV Storage in Cloudflare GUI
 1. In Cloudflare Dashboard, go to **Storage & Databases** -> **KV**.
-2. Click **Create Namespace**, name it `LISTING_KV`.
-3. Go back to **Workers & Pages** -> **`listing-alert`** -> **Settings** -> **Variables and Secrets**.
+2. Click **Create Namespace**, enter name: `LISTING_KV`.
+3. Go to **Workers & Pages** -> **`listing-alert`** -> **Settings** -> **Variables and Secrets**.
 4. Scroll down to **KV Namespace Bindings** and click **Add binding**.
    - **Variable name**: `LISTING_KV`
    - **KV namespace**: Select `LISTING_KV`.
 5. Click **Save and Deploy**.
+
+*(Alternatively, if using CLI to create KV namespace: run `npx wrangler kv namespace create LISTING_KV` and paste the generated `id` into `wrangler.json`).*
 
 ---
 
@@ -77,12 +75,3 @@ npx wrangler deploy
 2. Click **"Test Discord Webhook"** to confirm notifications arrive in your Discord channel.
 3. Click **"Run Check Now"** to execute an immediate scan.
 4. Sit back! The worker will automatically scan Mattel Creations every 10 minutes and alert you whenever a new vehicle drops.
-
----
-
-## 🛠️ Tech Stack
-
-- **Cloudflare Workers** (Edge Compute)
-- **Cloudflare KV** (Key-Value State Persistence)
-- **Discord Webhooks API** (Rich Embed Notifications)
-- **Shopify Storefront REST API** (Mattel Creations Product Data)

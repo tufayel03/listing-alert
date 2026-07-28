@@ -7,11 +7,5 @@
     "crons": [
       "*/10 * * * *"
     ]
-  },
-  "kv_namespaces": [
-    {
-      "binding": "LISTING_KV",
-      "id": "REPLACE_WITH_YOUR_KV_NAMESPACE_ID"
-    }
-  ]
+  }
 }
