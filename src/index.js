@@ -5,8 +5,9 @@
  * 1. Mattel Creations (Vehicles Category) - https://creations.mattel.com/collections/mattel-creations-shop-all
  * 2. JCAR Diecast (Hot Wheels Collection) - https://www.jcardiecast.com/collections/hot-wheels
  * 
- * Automatically checks both stores every 10 minutes for newly listed items.
- * Sends Discord notifications via Webhook and persists state in Cloudflare KV.
+ * Duplicate-Proof: Atomic individual KV keys per product ID prevent repeated alerts.
+ * Timezone: Bangladesh Dhaka Time (Asia/Dhaka).
+ * Alerts: Ultra-clean, concise (Name, Price, Link, Image, Dhaka Time).
  */
 
 // In-memory fallbacks if KV is not yet bound
@@ -148,6 +149,22 @@ function maskWebhook(url) {
 }
 
 /**
+ * Format timestamp into Bangladesh Dhaka Timezone (Asia/Dhaka).
+ */
+function formatDhakaTime(dateStr) {
+  const date = dateStr ? new Date(dateStr) : new Date();
+  return date.toLocaleString('en-US', {
+    timeZone: 'Asia/Dhaka',
+    month: 'short',
+    day: 'numeric',
+    year: 'numeric',
+    hour: 'numeric',
+    minute: '2-digit',
+    hour12: true
+  }) + ' (Dhaka Time)';
+}
+
+/**
  * Universal Shopify Catalog Fetcher with Pagination & Rate-Limit Throttling.
  */
 async function fetchShopifyCollection(baseUrl, refererUrl) {
@@ -187,6 +204,57 @@ async function fetchShopifyCollection(baseUrl, refererUrl) {
 }
 
 /**
+ * Master set of seen IDs stored in KV array or individual keys.
+ */
+async function getSeenIdSet(env, key, fallbackSet) {
+  const seenSet = new Set(fallbackSet);
+
+  if (env.LISTING_KV) {
+    try {
+      const data = await env.LISTING_KV.get(key, { type: 'json' });
+      if (Array.isArray(data)) {
+        for (const id of data) seenSet.add(String(id));
+      }
+    } catch (e) {}
+  }
+  return seenSet;
+}
+
+/**
+ * Save master ID set to KV array and fallback.
+ */
+async function saveSeenIdSet(env, key, idsArray) {
+  if (env.LISTING_KV) {
+    try {
+      await env.LISTING_KV.put(key, JSON.stringify(idsArray));
+    } catch (e) {}
+  }
+}
+
+/**
+ * Check individual atomic product key to prevent any possible duplicate.
+ */
+async function isSingleKeySeen(env, storePrefix, prodId) {
+  if (!env.LISTING_KV) return false;
+  try {
+    const res = await env.LISTING_KV.get(`${storePrefix}_ITEM_${prodId}`);
+    return res === '1';
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * Mark individual atomic product key as seen immediately.
+ */
+async function markSingleKeySeen(env, storePrefix, prodId) {
+  if (!env.LISTING_KV) return;
+  try {
+    await env.LISTING_KV.put(`${storePrefix}_ITEM_${prodId}`, '1');
+  } catch (e) {}
+}
+
+/**
  * Main function to check BOTH Mattel Creations & JCAR Diecast.
  */
 async function checkAllStores(env, isManual = false) {
@@ -213,16 +281,19 @@ async function checkAllStores(env, isManual = false) {
     mattelResult.total = mattelProducts.length;
     mattelResult.vehicles = mattelVehicles.length;
 
-    const seenMattelIds = await getSeenIds(env, 'SEEN_MATTEL_IDS', fallbackMattelIds);
+    const seenMattelIds = await getSeenIdSet(env, 'SEEN_MATTEL_IDS', fallbackMattelIds);
     const isFirstRun = seenMattelIds.size === 0;
 
-    const newMattel = [];
     const currentMattelIds = [];
+    const newMattel = [];
 
     for (const prod of mattelVehicles) {
       const idStr = String(prod.id);
       currentMattelIds.push(idStr);
-      if (!isFirstRun && !seenMattelIds.has(idStr)) {
+
+      const alreadySeen = seenMattelIds.has(idStr) || await isSingleKeySeen(env, 'MATTEL', idStr);
+
+      if (!isFirstRun && !alreadySeen) {
         newMattel.push(prod);
       }
     }
@@ -230,20 +301,28 @@ async function checkAllStores(env, isManual = false) {
     mattelResult.newCount = newMattel.length;
 
     if (isFirstRun) {
-      logMessages.push(`Mattel First Run: Saved master list of ${mattelVehicles.length} vehicles.`);
-      if (webhookUrl) {
-        await sendFirstRunWebhook(webhookUrl, 'Mattel Creations', mattelVehicles.length);
+      logMessages.push(`Mattel First Run: Initialized master database of ${mattelVehicles.length} vehicles.`);
+      for (const idStr of currentMattelIds) {
+        seenMattelIds.add(idStr);
+        await markSingleKeySeen(env, 'MATTEL', idStr);
       }
+      await saveSeenIdSet(env, 'SEEN_MATTEL_IDS', currentMattelIds);
+      fallbackMattelIds = seenMattelIds;
     } else if (newMattel.length > 0) {
       logMessages.push(`Found ${newMattel.length} NEW Mattel vehicle listings!`);
       for (const item of newMattel) {
-        await sendDiscordAlert(webhookUrl, item, 'Mattel Creations', 'https://creations.mattel.com', 0xFF0044);
-        logMessages.push(`Alert sent for Mattel item: ${item.title}`);
-      }
-    }
+        const idStr = String(item.id);
+        
+        // Mark as seen immediately BEFORE sending alert to prevent duplicate
+        seenMattelIds.add(idStr);
+        await markSingleKeySeen(env, 'MATTEL', idStr);
 
-    await saveSeenIds(env, 'SEEN_MATTEL_IDS', currentMattelIds);
-    fallbackMattelIds = new Set(currentMattelIds);
+        await sendDiscordAlert(webhookUrl, item, 'Mattel Creations', 'https://creations.mattel.com', 0xFF0044);
+        logMessages.push(`Alert sent: ${item.title}`);
+      }
+      await saveSeenIdSet(env, 'SEEN_MATTEL_IDS', Array.from(seenMattelIds));
+      fallbackMattelIds = seenMattelIds;
+    }
 
   } catch (err) {
     logMessages.push(`Mattel Scan Error: ${err.message}`);
@@ -262,16 +341,19 @@ async function checkAllStores(env, isManual = false) {
     jcarResult.total = jcarProducts.length;
     jcarResult.hotwheels = jcarProducts.length;
 
-    const seenJcarIds = await getSeenIds(env, 'SEEN_JCAR_IDS', fallbackJcarIds);
+    const seenJcarIds = await getSeenIdSet(env, 'SEEN_JCAR_IDS', fallbackJcarIds);
     const isFirstRun = seenJcarIds.size === 0;
 
-    const newJcar = [];
     const currentJcarIds = [];
+    const newJcar = [];
 
     for (const prod of jcarProducts) {
       const idStr = String(prod.id);
       currentJcarIds.push(idStr);
-      if (!isFirstRun && !seenJcarIds.has(idStr)) {
+
+      const alreadySeen = seenJcarIds.has(idStr) || await isSingleKeySeen(env, 'JCAR', idStr);
+
+      if (!isFirstRun && !alreadySeen) {
         newJcar.push(prod);
       }
     }
@@ -279,20 +361,28 @@ async function checkAllStores(env, isManual = false) {
     jcarResult.newCount = newJcar.length;
 
     if (isFirstRun) {
-      logMessages.push(`JCAR First Run: Saved master list of ${jcarProducts.length} Hot Wheels.`);
-      if (webhookUrl) {
-        await sendFirstRunWebhook(webhookUrl, 'JCAR Diecast (Hot Wheels)', jcarProducts.length);
+      logMessages.push(`JCAR First Run: Initialized master database of ${jcarProducts.length} Hot Wheels.`);
+      for (const idStr of currentJcarIds) {
+        seenJcarIds.add(idStr);
+        await markSingleKeySeen(env, 'JCAR', idStr);
       }
+      await saveSeenIdSet(env, 'SEEN_JCAR_IDS', currentJcarIds);
+      fallbackJcarIds = seenJcarIds;
     } else if (newJcar.length > 0) {
       logMessages.push(`Found ${newJcar.length} NEW JCAR Hot Wheels listings!`);
       for (const item of newJcar) {
-        await sendDiscordAlert(webhookUrl, item, 'JCAR Diecast', 'https://www.jcardiecast.com', 0xFF9900);
-        logMessages.push(`Alert sent for JCAR item: ${item.title}`);
-      }
-    }
+        const idStr = String(item.id);
 
-    await saveSeenIds(env, 'SEEN_JCAR_IDS', currentJcarIds);
-    fallbackJcarIds = new Set(currentJcarIds);
+        // Mark as seen immediately BEFORE sending alert to prevent duplicate
+        seenJcarIds.add(idStr);
+        await markSingleKeySeen(env, 'JCAR', idStr);
+
+        await sendDiscordAlert(webhookUrl, item, 'JCAR Diecast', 'https://www.jcardiecast.com', 0xFF9900);
+        logMessages.push(`Alert sent: ${item.title}`);
+      }
+      await saveSeenIdSet(env, 'SEEN_JCAR_IDS', Array.from(seenJcarIds));
+      fallbackJcarIds = seenJcarIds;
+    }
 
   } catch (err) {
     logMessages.push(`JCAR Scan Error: ${err.message}`);
@@ -334,32 +424,6 @@ function isVehicleProduct(product) {
 }
 
 /**
- * Get seen IDs from KV.
- */
-async function getSeenIds(env, key, fallbackSet) {
-  if (env.LISTING_KV) {
-    try {
-      const data = await env.LISTING_KV.get(key, { type: 'json' });
-      if (Array.isArray(data)) {
-        return new Set(data.map(String));
-      }
-    } catch (e) {}
-  }
-  return fallbackSet;
-}
-
-/**
- * Save seen IDs to KV.
- */
-async function saveSeenIds(env, key, idsArray) {
-  if (env.LISTING_KV) {
-    try {
-      await env.LISTING_KV.put(key, JSON.stringify(idsArray));
-    } catch (e) {}
-  }
-}
-
-/**
  * Save check metrics to KV.
  */
 async function saveMetrics(env, metrics) {
@@ -395,7 +459,7 @@ async function getStatusMetrics(env) {
 }
 
 /**
- * Send Discord Rich Embed for new product alert.
+ * Send Discord Rich Embed for new product alert (Ultra Short, Clean, Bangladesh Dhaka Time).
  */
 async function sendDiscordAlert(webhookUrl, product, storeName, baseUrl, embedColor) {
   if (!webhookUrl) return;
@@ -405,23 +469,19 @@ async function sendDiscordAlert(webhookUrl, product, storeName, baseUrl, embedCo
   const firstVariant = product.variants && product.variants.length > 0 ? product.variants[0] : null;
 
   const priceStr = firstVariant ? `$${parseFloat(firstVariant.price).toFixed(2)}` : 'N/A';
-  const availabilityStr = firstVariant && firstVariant.available ? '🟢 In Stock' : '🔴 Sold Out / Pre-Order';
+  const dhakaTimeStr = formatDhakaTime(product.published_at || product.created_at);
 
   const embed = {
-    title: `🚨 NEW LISTING: ${product.title}`,
+    title: product.title,
     url: productUrl,
     color: embedColor || 0xFF0044,
-    description: `A new item has just been listed on **${storeName}**!`,
     fields: [
-      { name: '🏪 Store', value: storeName, inline: true },
       { name: '💰 Price', value: priceStr, inline: true },
-      { name: '📦 Status', value: availabilityStr, inline: true },
-      { name: '🕒 Published', value: product.published_at ? new Date(product.published_at).toLocaleString() : 'Just now', inline: false }
+      { name: '🕒 Listed', value: dhakaTimeStr, inline: true }
     ],
     footer: {
-      text: `${storeName} Listing Alert • Cloudflare Worker`
-    },
-    timestamp: new Date().toISOString()
+      text: `${storeName} Alert`
+    }
   };
 
   if (firstImage) {
@@ -429,7 +489,7 @@ async function sendDiscordAlert(webhookUrl, product, storeName, baseUrl, embedCo
   }
 
   const payload = {
-    username: `${storeName} Alert`,
+    username: storeName,
     embeds: [embed]
   };
 
@@ -437,27 +497,6 @@ async function sendDiscordAlert(webhookUrl, product, storeName, baseUrl, embedCo
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload)
-  });
-}
-
-/**
- * Send welcome webhook when store monitor initializes.
- */
-async function sendFirstRunWebhook(webhookUrl, storeName, count) {
-  if (!webhookUrl) return;
-
-  const embed = {
-    title: `✅ ${storeName} Monitor Initialized`,
-    description: `Monitor successfully active! Scanned and saved **${count}** existing items to the master database. Checks run every 10 minutes.`,
-    color: 0x00D2FF,
-    footer: { text: 'Multi-Store Listing Alert' },
-    timestamp: new Date().toISOString()
-  };
-
-  await fetch(webhookUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ embeds: [embed] })
   });
 }
 
@@ -473,12 +512,11 @@ async function sendTestDiscordAlert(env) {
 
   const embed = {
     title: '🔔 Test Alert - Multi-Store Listing Monitor',
-    description: 'This is a test notification from your Cloudflare Worker monitor. Discord webhook is working perfectly for both Mattel Creations and JCAR Diecast!',
+    description: 'Discord Webhook test successful! Listing time is set to Bangladesh Dhaka Time.',
     color: 0x00FF88,
     fields: [
-      { name: 'Mattel Creations', value: 'Active (Vehicles)', inline: true },
-      { name: 'JCAR Diecast', value: 'Active (Hot Wheels)', inline: true },
-      { name: 'Schedule', value: 'Every 10 Minutes', inline: false }
+      { name: 'Timezone', value: 'Asia/Dhaka (Bangladesh Time)', inline: true },
+      { name: 'Schedule', value: 'Every 10 Minutes', inline: true }
     ],
     footer: { text: 'Multi-Store Alert Setup Test' },
     timestamp: new Date().toISOString()
@@ -610,10 +648,6 @@ function renderDashboard(metrics, env, activeWebhook) {
       backdrop-filter: blur(12px);
       box-shadow: 0 8px 32px rgba(0, 0, 0, 0.3);
       transition: transform 0.2s ease, border-color 0.2s ease;
-    }
-
-    .card:hover {
-      border-color: rgba(255, 255, 255, 0.18);
     }
 
     .card-title {
@@ -749,7 +783,7 @@ function renderDashboard(metrics, env, activeWebhook) {
       <div class="brand-logo">MC + JCAR</div>
       <div>
         <h1>Multi-Store Listing Alert</h1>
-        <p class="subtitle">Monitoring Mattel Creations & JCAR Diecast • Every 10 Minutes</p>
+        <p class="subtitle">Bangladesh Dhaka Time (Asia/Dhaka) • Every 10 Minutes</p>
       </div>
     </div>
   </header>
@@ -791,7 +825,7 @@ function renderDashboard(metrics, env, activeWebhook) {
     <div class="webhook-box">
       <h3>🔔 Discord Webhook URL</h3>
       <p style="color: var(--text-muted); font-size: 0.9rem;">
-        Paste your Discord Webhook URL below to receive new listing notifications for both stores.
+        Paste your Discord Webhook URL below to receive short & clean new listing alerts.
       </p>
       <div class="input-group">
         <input 
@@ -836,7 +870,7 @@ ${(metrics.logs || ['Waiting for first run...']).join('\n')}
   </main>
 
   <footer>
-    Multi-Store Listing Monitor • Mattel Creations & JCAR Diecast
+    Multi-Store Listing Monitor • Bangladesh Dhaka Timezone (Asia/Dhaka)
   </footer>
 
   <script>
