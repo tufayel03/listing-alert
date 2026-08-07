@@ -1,3 +1,4 @@
-# Discord Webhook URL (Required for sending alerts)
-# Replace with your actual Discord Webhook URL in Cloudflare Worker Dashboard -> Settings -> Variables
-DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/YOUR_WEBHOOK_ID/YOUR_WEBHOOK_TOKEN
+# Discord Webhook URLs (Store-Specific)
+# Optional override variables if needed (Cloudflare Worker Dashboard -> Settings -> Variables)
+MATTEL_WEBHOOK_URL=https://discord.com/api/webhooks/1535216741594959952/XGdwH4rRfxUC2bLAoilNMHzcu9y1Bae5Ssva894acnZgbaxNTrETnoE03R2sdJ13h8Na
+JCAR_WEBHOOK_URL=https://discord.com/api/webhooks/1460971531348738090/EYQuVVAH4eYpSE5fCTGcWiVbp6Ct9-LcIKRMwUeALmdaww3QWWVDHxRMLCKl_2jsrdVH

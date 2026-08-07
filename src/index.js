@@ -9,14 +9,19 @@
  * - Routine 10-Minute Cron: Scans Page 1 & 2 with `sort_by=created-descending` (Ultra-fast <400ms scan).
  * - First Run / Master Sync: Scans all pages to register entire historical catalog.
  * - Timezone: Bangladesh Dhaka Time (Asia/Dhaka).
- * - Alerts: Ultra-clean, concise (Name, Price, Link, Image, Dhaka Time).
+ * - Alerts: Sent to SEPARATE Discord webhooks for Mattel and JCAR stores.
  */
+
+// Default store webhook URLs
+const DEFAULT_JCAR_WEBHOOK_URL = 'https://discord.com/api/webhooks/1460971531348738090/EYQuVVAH4eYpSE5fCTGcWiVbp6Ct9-LcIKRMwUeALmdaww3QWWVDHxRMLCKl_2jsrdVH';
+const DEFAULT_MATTEL_WEBHOOK_URL = 'https://discord.com/api/webhooks/1535216741594959952/XGdwH4rRfxUC2bLAoilNMHzcu9y1Bae5Ssva894acnZgbaxNTrETnoE03R2sdJ13h8Na';
 
 // In-memory fallbacks if KV is not yet bound
 let fallbackMattelIds = new Set();
 let fallbackJcarIds = new Set();
 let fallbackLastCheck = null;
-let fallbackWebhookUrl = '';
+let fallbackMattelWebhookUrl = '';
+let fallbackJcarWebhookUrl = '';
 
 export default {
   /**
@@ -43,6 +48,7 @@ export default {
     if (url.pathname === '/api/save-webhook' && request.method === 'POST') {
       try {
         const body = await request.json();
+        const store = body.store === 'jcar' ? 'jcar' : 'mattel';
         const webhookUrl = body.webhookUrl ? body.webhookUrl.trim() : '';
 
         if (!webhookUrl || !webhookUrl.startsWith('https://discord.com/api/webhooks/')) {
@@ -55,12 +61,13 @@ export default {
           });
         }
 
-        await saveWebhookUrl(env, webhookUrl);
-        const testResult = await sendTestDiscordAlert(env);
+        await saveWebhookUrl(env, store, webhookUrl);
+        const testResult = await sendTestDiscordAlert(env, store);
 
         return new Response(JSON.stringify({
           success: true,
-          message: 'Webhook saved permanently to KV storage and verified successfully!',
+          store,
+          message: `${store === 'mattel' ? 'Mattel Creations' : 'JCAR Diecast'} webhook saved permanently and verified successfully!`,
           testResult
         }), {
           headers: { 'Content-Type': 'application/json' }
@@ -74,14 +81,30 @@ export default {
     }
 
     if (url.pathname === '/api/clear-webhook' && request.method === 'POST') {
-      await saveWebhookUrl(env, '');
-      return new Response(JSON.stringify({ success: true, message: 'Webhook cleared.' }), {
+      const body = await request.json().catch(() => ({}));
+      const store = body.store === 'jcar' ? 'jcar' : 'mattel';
+      await saveWebhookUrl(env, store, '');
+      return new Response(JSON.stringify({ success: true, message: `${store === 'mattel' ? 'Mattel' : 'JCAR'} webhook reset to default.` }), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
     if (url.pathname === '/api/test-discord' && request.method === 'POST') {
-      const result = await sendTestDiscordAlert(env);
+      const body = await request.json().catch(() => ({}));
+      const store = body.store;
+      let result;
+      if (store) {
+        result = await sendTestDiscordAlert(env, store);
+      } else {
+        const mattelRes = await sendTestDiscordAlert(env, 'mattel');
+        const jcarRes = await sendTestDiscordAlert(env, 'jcar');
+        result = {
+          success: mattelRes.success && jcarRes.success,
+          mattel: mattelRes,
+          jcar: jcarRes,
+          message: `Mattel Test: ${mattelRes.message || mattelRes.error} | JCAR Test: ${jcarRes.message || jcarRes.error}`
+        };
+      }
       return new Response(JSON.stringify(result, null, 2), {
         headers: { 'Content-Type': 'application/json' }
       });
@@ -89,19 +112,27 @@ export default {
 
     if (url.pathname === '/api/status') {
       const metrics = await getStatusMetrics(env);
-      const activeWebhook = await getActiveWebhookUrl(env);
+      const mattelWebhook = await getActiveWebhookUrl(env, 'mattel');
+      const jcarWebhook = await getActiveWebhookUrl(env, 'jcar');
       return new Response(JSON.stringify({
         ...metrics,
-        hasWebhook: Boolean(activeWebhook),
-        maskedWebhook: activeWebhook ? maskWebhook(activeWebhook) : ''
+        mattelWebhook: {
+          hasWebhook: Boolean(mattelWebhook),
+          maskedWebhook: maskWebhook(mattelWebhook)
+        },
+        jcarWebhook: {
+          hasWebhook: Boolean(jcarWebhook),
+          maskedWebhook: maskWebhook(jcarWebhook)
+        }
       }, null, 2), {
         headers: { 'Content-Type': 'application/json' }
       });
     }
 
     // Serve HTML Dashboard for all browser requests
-    const activeWebhook = await getActiveWebhookUrl(env);
-    const html = renderDashboard(await getStatusMetrics(env), env, activeWebhook);
+    const mattelWebhook = await getActiveWebhookUrl(env, 'mattel');
+    const jcarWebhook = await getActiveWebhookUrl(env, 'jcar');
+    const html = renderDashboard(await getStatusMetrics(env), env, mattelWebhook, jcarWebhook);
     return new Response(html, {
       headers: { 'Content-Type': 'text/html; charset=utf-8' }
     });
@@ -109,37 +140,62 @@ export default {
 };
 
 /**
- * Get active Discord Webhook URL.
+ * Get active Discord Webhook URL for specific store ('mattel' or 'jcar').
  */
-async function getActiveWebhookUrl(env) {
+async function getActiveWebhookUrl(env, store = 'mattel') {
+  const isMattel = store === 'mattel';
+  const kvKey = isMattel ? 'SAVED_MATTEL_WEBHOOK_URL' : 'SAVED_JCAR_WEBHOOK_URL';
+  const envVar = isMattel ? env.MATTEL_WEBHOOK_URL : env.JCAR_WEBHOOK_URL;
+  const defaultUrl = isMattel ? DEFAULT_MATTEL_WEBHOOK_URL : DEFAULT_JCAR_WEBHOOK_URL;
+  const fallbackUrl = isMattel ? fallbackMattelWebhookUrl : fallbackJcarWebhookUrl;
+
   if (env.LISTING_KV) {
     try {
-      const kvWebhook = await env.LISTING_KV.get('SAVED_WEBHOOK_URL');
+      const kvWebhook = await env.LISTING_KV.get(kvKey);
       if (kvWebhook && kvWebhook.trim()) return kvWebhook.trim();
+    } catch (e) {}
+  }
+  if (envVar && envVar.trim()) {
+    return envVar.trim();
+  }
+  // Check legacy generic webhook configuration if store specific is missing
+  if (env.LISTING_KV) {
+    try {
+      const genericKv = await env.LISTING_KV.get('SAVED_WEBHOOK_URL');
+      if (genericKv && genericKv.trim()) return genericKv.trim();
     } catch (e) {}
   }
   if (env.DISCORD_WEBHOOK_URL && env.DISCORD_WEBHOOK_URL.trim()) {
     return env.DISCORD_WEBHOOK_URL.trim();
   }
-  return fallbackWebhookUrl;
+  if (fallbackUrl && fallbackUrl.trim()) {
+    return fallbackUrl.trim();
+  }
+  return defaultUrl;
 }
 
 /**
- * Save Discord Webhook URL.
+ * Save Discord Webhook URL for specific store ('mattel' or 'jcar').
  */
-async function saveWebhookUrl(env, url) {
+async function saveWebhookUrl(env, store, url) {
+  const isMattel = store === 'mattel';
+  const kvKey = isMattel ? 'SAVED_MATTEL_WEBHOOK_URL' : 'SAVED_JCAR_WEBHOOK_URL';
   if (env.LISTING_KV) {
     try {
       if (url) {
-        await env.LISTING_KV.put('SAVED_WEBHOOK_URL', url);
+        await env.LISTING_KV.put(kvKey, url);
       } else {
-        await env.LISTING_KV.delete('SAVED_WEBHOOK_URL');
+        await env.LISTING_KV.delete(kvKey);
       }
     } catch (e) {
-      console.error('Failed to save webhook to KV:', e);
+      console.error(`Failed to save ${store} webhook to KV:`, e);
     }
   }
-  fallbackWebhookUrl = url;
+  if (isMattel) {
+    fallbackMattelWebhookUrl = url;
+  } else {
+    fallbackJcarWebhookUrl = url;
+  }
 }
 
 /**
@@ -268,7 +324,8 @@ async function checkAllStores(env, isManual = false) {
   let logMessages = [];
   logMessages.push(`[${timestamp}] Starting multi-store scan... (Mode: ${isManual ? 'Full Scan' : 'Fast Routine Check'})`);
 
-  const webhookUrl = await getActiveWebhookUrl(env);
+  const mattelWebhookUrl = await getActiveWebhookUrl(env, 'mattel');
+  const jcarWebhookUrl = await getActiveWebhookUrl(env, 'jcar');
 
   let mattelResult = { total: 0, vehicles: 0, newCount: 0 };
   let jcarResult = { total: 0, hotwheels: 0, newCount: 0 };
@@ -324,8 +381,8 @@ async function checkAllStores(env, isManual = false) {
         seenMattelIds.add(idStr);
         await markSingleKeySeen(env, 'MATTEL', idStr);
 
-        await sendDiscordAlert(webhookUrl, item, 'Mattel Creations', 'https://creations.mattel.com', 0xFF0044);
-        logMessages.push(`Alert sent: ${item.title}`);
+        await sendDiscordAlert(mattelWebhookUrl, item, 'Mattel Creations', 'https://creations.mattel.com', 0xFF0044);
+        logMessages.push(`Mattel Alert sent: ${item.title}`);
       }
       await saveSeenIdSet(env, 'SEEN_MATTEL_IDS', Array.from(seenMattelIds));
       fallbackMattelIds = seenMattelIds;
@@ -385,8 +442,8 @@ async function checkAllStores(env, isManual = false) {
         seenJcarIds.add(idStr);
         await markSingleKeySeen(env, 'JCAR', idStr);
 
-        await sendDiscordAlert(webhookUrl, item, 'JCAR Diecast', 'https://www.jcardiecast.com', 0xFF9900);
-        logMessages.push(`Alert sent: ${item.title}`);
+        await sendDiscordAlert(jcarWebhookUrl, item, 'JCAR Diecast', 'https://www.jcardiecast.com', 0xFF9900);
+        logMessages.push(`JCAR Alert sent: ${item.title}`);
       }
       await saveSeenIdSet(env, 'SEEN_JCAR_IDS', Array.from(seenJcarIds));
       fallbackJcarIds = seenJcarIds;
@@ -509,24 +566,28 @@ async function sendDiscordAlert(webhookUrl, product, storeName, baseUrl, embedCo
 }
 
 /**
- * Send test embed.
+ * Send test embed for specific store ('mattel' or 'jcar').
  */
-async function sendTestDiscordAlert(env) {
-  const webhookUrl = await getActiveWebhookUrl(env);
+async function sendTestDiscordAlert(env, store = 'mattel') {
+  const webhookUrl = await getActiveWebhookUrl(env, store);
+  const isMattel = store === 'mattel';
+  const storeName = isMattel ? 'Mattel Creations' : 'JCAR Diecast';
+  const embedColor = isMattel ? 0xFF0044 : 0xFF9900;
 
   if (!webhookUrl) {
-    return { success: false, error: 'Discord Webhook URL is not set. Please paste your Discord Webhook URL in the input box and click Save Webhook!' };
+    return { success: false, error: `${storeName} Discord Webhook URL is not configured.` };
   }
 
   const embed = {
-    title: '🔔 Test Alert - Multi-Store Listing Monitor',
-    description: 'Discord Webhook test successful! Listing time is set to Bangladesh Dhaka Time.',
-    color: 0x00FF88,
+    title: `🔔 Test Alert - ${storeName}`,
+    description: `Discord Webhook test successful for **${storeName}**! Alerts arrive in Bangladesh Dhaka Time.`,
+    color: embedColor,
     fields: [
+      { name: 'Store Target', value: storeName, inline: true },
       { name: 'Timezone', value: 'Asia/Dhaka (Bangladesh Time)', inline: true },
       { name: 'Schedule', value: 'Every 10 Minutes', inline: true }
     ],
-    footer: { text: 'Multi-Store Alert Setup Test' },
+    footer: { text: `${storeName} Notification Test` },
     timestamp: new Date().toISOString()
   };
 
@@ -534,14 +595,14 @@ async function sendTestDiscordAlert(env) {
     const res = await fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ embeds: [embed] })
+      body: JSON.stringify({ username: `${storeName} Monitor`, embeds: [embed] })
     });
 
     if (!res.ok) {
       throw new Error(`Discord API returned status ${res.status}`);
     }
 
-    return { success: true, message: 'Test message sent to Discord successfully!' };
+    return { success: true, message: `Test message sent to ${storeName} Discord webhook successfully!` };
   } catch (err) {
     return { success: false, error: err.message };
   }
@@ -550,9 +611,7 @@ async function sendTestDiscordAlert(env) {
 /**
  * Render HTML Dashboard.
  */
-function renderDashboard(metrics, env, activeWebhook) {
-  const hasWebhook = Boolean(activeWebhook);
-  const maskedWebhookStr = activeWebhook ? maskWebhook(activeWebhook) : '';
+function renderDashboard(metrics, env, mattelWebhook, jcarWebhook) {
   const hasKV = Boolean(env.LISTING_KV);
 
   const mattelVehicles = metrics.mattel ? metrics.mattel.vehicles : (metrics.totalVehicles || 0);
@@ -574,6 +633,8 @@ function renderDashboard(metrics, env, activeWebhook) {
       --card-border: rgba(255, 255, 255, 0.08);
       --primary: #ff0044;
       --primary-glow: rgba(255, 0, 68, 0.35);
+      --jcar-color: #ff9900;
+      --jcar-glow: rgba(255, 153, 0, 0.35);
       --accent: #00d2ff;
       --text: #f3f4f6;
       --text-muted: #9ca3af;
@@ -686,33 +747,65 @@ function renderDashboard(metrics, env, activeWebhook) {
 
     .badge-success { background: rgba(16, 185, 129, 0.15); color: var(--success); border: 1px solid rgba(16, 185, 129, 0.3); }
     .badge-warning { background: rgba(245, 158, 11, 0.15); color: var(--warning); border: 1px solid rgba(245, 158, 11, 0.3); }
+    .badge-danger { background: rgba(239, 68, 68, 0.15); color: var(--danger); border: 1px solid rgba(239, 68, 68, 0.3); }
+
+    .webhooks-container {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+      gap: 1.5rem;
+      margin-bottom: 2rem;
+    }
 
     .webhook-box {
       background: var(--card-bg);
       border: 1px solid var(--card-border);
       border-radius: 16px;
       padding: 1.5rem;
-      margin-bottom: 2rem;
+      backdrop-filter: blur(12px);
     }
+
+    .webhook-header {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 0.5rem;
+    }
+
+    .store-tag {
+      font-family: 'Outfit', sans-serif;
+      font-weight: 700;
+      font-size: 0.75rem;
+      padding: 0.2rem 0.6rem;
+      border-radius: 6px;
+      text-transform: uppercase;
+    }
+
+    .tag-mattel { background: rgba(255, 0, 68, 0.2); color: #ff3366; border: 1px solid rgba(255, 0, 68, 0.4); }
+    .tag-jcar { background: rgba(255, 153, 0, 0.2); color: #ffaa22; border: 1px solid rgba(255, 153, 0, 0.4); }
 
     .input-group {
       display: flex;
+      flex-direction: column;
       gap: 0.75rem;
       margin-top: 1rem;
-      flex-wrap: wrap;
     }
 
     .input-field {
-      flex: 1;
-      min-width: 300px;
+      width: 100%;
       background: rgba(0, 0, 0, 0.35);
       border: 1px solid var(--card-border);
       border-radius: 10px;
       padding: 0.85rem 1rem;
       color: #fff;
       font-family: 'Inter', sans-serif;
-      font-size: 0.95rem;
+      font-size: 0.88rem;
       outline: none;
+    }
+
+    .button-row {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
     }
 
     .actions {
@@ -725,8 +818,8 @@ function renderDashboard(metrics, env, activeWebhook) {
     .btn {
       font-family: 'Outfit', sans-serif;
       font-weight: 600;
-      font-size: 0.95rem;
-      padding: 0.85rem 1.4rem;
+      font-size: 0.92rem;
+      padding: 0.75rem 1.25rem;
       border-radius: 12px;
       border: none;
       cursor: pointer;
@@ -741,6 +834,12 @@ function renderDashboard(metrics, env, activeWebhook) {
       background: linear-gradient(135deg, var(--primary), #d90036);
       color: white;
       box-shadow: 0 4px 20px var(--primary-glow);
+    }
+
+    .btn-jcar {
+      background: linear-gradient(135deg, var(--jcar-color), #d97700);
+      color: white;
+      box-shadow: 0 4px 20px var(--jcar-glow);
     }
 
     .btn-accent {
@@ -791,7 +890,7 @@ function renderDashboard(metrics, env, activeWebhook) {
       <div class="brand-logo">MC + JCAR</div>
       <div>
         <h1>Multi-Store Listing Alert</h1>
-        <p class="subtitle">Bangladesh Dhaka Time (Asia/Dhaka) • Fast Newest-First Scans</p>
+        <p class="subtitle">Bangladesh Dhaka Time (Asia/Dhaka) • Separate Store Webhooks</p>
       </div>
     </div>
   </header>
@@ -829,33 +928,77 @@ function renderDashboard(metrics, env, activeWebhook) {
       </div>
     </div>
 
-    <!-- Webhook GUI Input Box -->
-    <div class="webhook-box">
-      <h3>🔔 Discord Webhook URL</h3>
-      <p style="color: var(--text-muted); font-size: 0.9rem;">
-        Paste your Discord Webhook URL below to receive short & clean new listing alerts.
-      </p>
-      <div class="input-group">
-        <input 
-          type="url" 
-          id="webhook-input" 
-          class="input-field" 
-          placeholder="https://discord.com/api/webhooks/123456789/abcxyz..."
-          value="${activeWebhook || ''}"
-        />
-        <button class="btn btn-accent" onclick="saveWebhook()">
-          💾 Save & Verify Webhook
-        </button>
-        ${hasWebhook ? `<button class="btn btn-secondary" onclick="clearWebhook()">🗑️ Clear</button>` : ''}
+    <!-- Webhook GUI Input Boxes -->
+    <div class="webhooks-container">
+      <!-- Mattel Creations Webhook -->
+      <div class="webhook-box">
+        <div class="webhook-header">
+          <span class="store-tag tag-mattel">Mattel Creations</span>
+          <h3 style="font-size: 1.1rem;">Discord Webhook</h3>
+        </div>
+        <p style="color: var(--text-muted); font-size: 0.85rem;">
+          Alerts for new Mattel vehicle listings go here.
+        </p>
+        <div class="input-group">
+          <input 
+            type="url" 
+            id="mattel-webhook-input" 
+            class="input-field" 
+            placeholder="https://discord.com/api/webhooks/..."
+            value="${mattelWebhook || ''}"
+          />
+          <div class="button-row">
+            <button class="btn btn-primary" onclick="saveWebhook('mattel')">
+              💾 Save
+            </button>
+            <button class="btn btn-secondary" onclick="sendTestDiscord('mattel')">
+              🔔 Test
+            </button>
+            <button class="btn btn-secondary" onclick="clearWebhook('mattel')">
+              🗑️ Reset
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- JCAR Diecast Webhook -->
+      <div class="webhook-box">
+        <div class="webhook-header">
+          <span class="store-tag tag-jcar">JCAR Diecast</span>
+          <h3 style="font-size: 1.1rem;">Discord Webhook</h3>
+        </div>
+        <p style="color: var(--text-muted); font-size: 0.85rem;">
+          Alerts for new JCAR Hot Wheels listings go here.
+        </p>
+        <div class="input-group">
+          <input 
+            type="url" 
+            id="jcar-webhook-input" 
+            class="input-field" 
+            placeholder="https://discord.com/api/webhooks/..."
+            value="${jcarWebhook || ''}"
+          />
+          <div class="button-row">
+            <button class="btn btn-jcar" onclick="saveWebhook('jcar')">
+              💾 Save
+            </button>
+            <button class="btn btn-secondary" onclick="sendTestDiscord('jcar')">
+              🔔 Test
+            </button>
+            <button class="btn btn-secondary" onclick="clearWebhook('jcar')">
+              🗑️ Reset
+            </button>
+          </div>
+        </div>
       </div>
     </div>
 
     <div class="actions">
-      <button class="btn btn-primary" onclick="runManualCheck()">
+      <button class="btn btn-accent" onclick="runManualCheck()">
         ⚡ Run Check Now (Both Stores)
       </button>
       <button class="btn btn-secondary" onclick="sendTestDiscord()">
-        🔔 Test Discord Webhook
+        🔔 Test Both Webhooks
       </button>
       <a href="https://creations.mattel.com/collections/mattel-creations-shop-all?#filter.tags_category=Vehicles" target="_blank" rel="noopener" class="btn btn-secondary">
         🔗 Mattel Store
@@ -882,33 +1025,35 @@ ${(metrics.logs || ['Waiting for first run...']).join('\n')}
   </footer>
 
   <script>
-    async function saveWebhook() {
-      const input = document.getElementById('webhook-input');
+    async function saveWebhook(store) {
+      const inputId = store === 'jcar' ? 'jcar-webhook-input' : 'mattel-webhook-input';
+      const input = document.getElementById(inputId);
       const toast = document.getElementById('output-toast');
       const url = input.value.trim();
+      const storeLabel = store === 'jcar' ? 'JCAR' : 'Mattel';
 
       if (!url) {
         toast.style.display = 'block';
         toast.className = 'badge-danger';
-        toast.innerText = 'Please paste a valid Discord Webhook URL!';
+        toast.innerText = 'Please paste a valid Discord Webhook URL for ' + storeLabel + '!';
         return;
       }
 
       toast.style.display = 'block';
       toast.className = 'badge-warning';
-      toast.innerText = '⏳ Saving Webhook and sending test alert...';
+      toast.innerText = '⏳ Saving ' + storeLabel + ' Webhook and sending test alert...';
 
       try {
         const res = await fetch('/api/save-webhook', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ webhookUrl: url })
+          body: JSON.stringify({ store, webhookUrl: url })
         });
         const data = await res.json();
 
         if (data.success) {
           toast.className = 'badge-success';
-          toast.innerText = '✅ Webhook saved successfully! Test notification sent to Discord.';
+          toast.innerText = '✅ ' + storeLabel + ' webhook saved successfully! Test notification sent to Discord.';
           setTimeout(() => location.reload(), 2000);
         } else {
           toast.className = 'badge-danger';
@@ -920,17 +1065,22 @@ ${(metrics.logs || ['Waiting for first run...']).join('\n')}
       }
     }
 
-    async function clearWebhook() {
-      if (!confirm('Are you sure you want to remove the Discord Webhook URL?')) return;
+    async function clearWebhook(store) {
+      const storeLabel = store === 'jcar' ? 'JCAR' : 'Mattel';
+      if (!confirm('Are you sure you want to reset the ' + storeLabel + ' Webhook URL?')) return;
       const toast = document.getElementById('output-toast');
       toast.style.display = 'block';
       toast.className = 'badge-warning';
-      toast.innerText = '⏳ Clearing Webhook...';
+      toast.innerText = '⏳ Resetting ' + storeLabel + ' Webhook...';
 
       try {
-        await fetch('/api/clear-webhook', { method: 'POST' });
+        await fetch('/api/clear-webhook', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ store })
+        });
         toast.className = 'badge-success';
-        toast.innerText = 'Webhook cleared!';
+        toast.innerText = storeLabel + ' Webhook reset to default!';
         setTimeout(() => location.reload(), 1500);
       } catch (err) {
         toast.className = 'badge-danger';
@@ -960,22 +1110,26 @@ ${(metrics.logs || ['Waiting for first run...']).join('\n')}
       }
     }
 
-    async function sendTestDiscord() {
+    async function sendTestDiscord(store) {
       const toast = document.getElementById('output-toast');
       toast.style.display = 'block';
       toast.className = 'badge-warning';
       toast.innerText = '⏳ Sending test notification to Discord...';
 
       try {
-        const res = await fetch('/api/test-discord', { method: 'POST' });
+        const res = await fetch('/api/test-discord', { 
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(store ? { store } : {})
+        });
         const data = await res.json();
 
         if (data.success) {
           toast.className = 'badge-success';
-          toast.innerText = '✅ ' + data.message;
+          toast.innerText = '✅ ' + (data.message || 'Test message sent successfully!');
         } else {
           toast.className = 'badge-danger';
-          toast.innerText = '❌ Error: ' + data.error;
+          toast.innerText = '❌ Error: ' + (data.error || data.message || 'Failed to send test alert');
         }
       } catch (err) {
         toast.className = 'badge-danger';
